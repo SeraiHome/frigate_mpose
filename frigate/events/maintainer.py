@@ -107,23 +107,27 @@ class EventProcessor(threading.Thread):
                     continue
 
                 self.handle_object_detection(event_type, camera, event_data)
-            elif source_type == EventTypeEnum.pose:
+            elif source_type == EventTypeEnum.tracked_pose:
+                id = event_data["id"]
                 self.timeline_queue.put(
                     (
                         camera,
                         source_type,
                         event_type,
-                        self.events_in_process.get(event_data["id"]),
+                        self.events_in_process.get(id),
                         event_data,
                     )
                 )
-                
-                # Handle pose events similar to object detection
-                id = event_data["id"]
-                if event_type == EventStateEnum.start or id not in self.events_in_process:
+
+                # if this is the first message, just store it and continue, its not time to insert it in the db
+                if (
+                    event_type == EventStateEnum.start
+                    or id not in self.events_in_process
+                ):
                     self.events_in_process[id] = event_data
-                else:
-                    self.handle_pose_detection(event_type, camera, event_data)
+                    continue
+
+                self.handle_pose_detection(event_type, camera, event_data)
             elif source_type == EventTypeEnum.api:
                 self.timeline_queue.put(
                     (
@@ -274,6 +278,119 @@ class EventProcessor(threading.Thread):
             del self.events_in_process[event_data["id"]]
             self.event_end_publisher.publish((event_data["id"], camera, updated_db))
 
+    def handle_pose_detection(
+        self,
+        event_type: str,
+        camera: str,
+        event_data: Event,
+    ) -> None:
+        """handle tracked pose event updates."""
+        updated_db = False
+
+        if should_update_db(self.events_in_process[event_data["id"]], event_data):
+            updated_db = True
+            camera_config = self.config.cameras[camera]
+            width = camera_config.detect.width
+            height = camera_config.detect.height
+            # Get first pose detector or None if no detectors configured
+            pose_detector_values = list(self.config.pose_detectors.values())
+            first_pose_detector = pose_detector_values[0] if pose_detector_values else None
+
+            start_time = event_data["start_time"]
+            end_time = (
+                None if event_data["end_time"] is None else event_data["end_time"]
+            )
+            # confidence of the pose snapshot
+            confidence = (
+                None
+                if event_data["snapshot"] is None
+                else event_data["snapshot"]["confidence"]
+            )
+            # detection region in the snapshot
+            region = (
+                None
+                if event_data["snapshot"] is None
+                else to_relative_box(
+                    width,
+                    height,
+                    event_data["snapshot"]["region"],
+                )
+            )
+            # bounding box for the pose snapshot
+            box = (
+                None
+                if event_data["snapshot"] is None
+                else to_relative_box(
+                    width,
+                    height,
+                    event_data["snapshot"]["box"],
+                )
+            )
+
+            # keypoints data
+            keypoints = (
+                None
+                if event_data["snapshot"] is None
+                else event_data["snapshot"]["keypoints"]
+            )
+
+            # keep these from being set back to false because the event
+            # may have started while recordings/snapshots/alerts/detections were enabled
+            if self.events_in_process[event_data["id"]]["has_clip"]:
+                event_data["has_clip"] = True
+            if self.events_in_process[event_data["id"]]["has_snapshot"]:
+                event_data["has_snapshot"] = True
+
+            event = {
+                Event.id: event_data["id"],
+                Event.label: event_data.get("action", "pose"),  # Use pose action as label
+                Event.camera: camera,
+                Event.start_time: start_time,
+                Event.end_time: end_time,
+                Event.zones: list(event_data["entered_zones"]),
+                Event.thumbnail: event_data.get("thumbnail"),
+                Event.has_clip: event_data["has_clip"],
+                Event.has_snapshot: event_data["has_snapshot"],
+                Event.model_hash: first_pose_detector.model.model_hash if first_pose_detector else None,
+                Event.model_type: first_pose_detector.model.model_type if first_pose_detector else None,
+                Event.detector_type: first_pose_detector.type if first_pose_detector else None,
+                Event.data: {
+                    "box": box,
+                    "region": region,
+                    "confidence": confidence,
+                    "top_score": event_data["confidence"],
+                    "keypoints": keypoints,
+                    "action": event_data.get("action"),
+                    "action_confidence": event_data.get("action_confidence"),
+                    "type": "pose",
+                },
+            }
+
+            # only overwrite the sub_label in the database if it's set (for pose action)
+            if event_data.get("action") is not None:
+                event[Event.sub_label] = event_data["action"]
+                event[Event.data]["action_confidence"] = event_data.get("action_confidence", 0.0)
+
+            (
+                Event.insert(event)
+                .on_conflict(
+                    conflict_target=[Event.id],
+                    update=event,
+                )
+                .execute()
+            )
+
+        # check if the stored event_data should be updated
+        if updated_db or should_update_state(
+            self.events_in_process[event_data["id"]], event_data
+        ):
+            # update the stored copy for comparison on future update messages
+            self.events_in_process[event_data["id"]] = event_data
+
+        if event_type == EventStateEnum.end:
+            del self.events_in_process[event_data["id"]]
+            self.event_end_publisher.publish((event_data["id"], camera, updated_db))
+
     def handle_external_detection(
         self, event_type: EventStateEnum, event_data: Event
     ) -> None:
@@ -313,88 +430,3 @@ class EventProcessor(threading.Thread):
                 Event.update(event).where(Event.id == event_data["id"]).execute()
             except Exception:
                 logger.warning(f"Failed to update manual event: {event_data['id']}")
-
-    def handle_pose_detection(
-        self,
-        event_type: str,
-        camera: str,
-        event_data: Event,
-    ) -> None:
-        """Handle pose detection event updates."""
-        updated_db = False
-
-        if should_update_db(self.events_in_process[event_data["id"]], event_data):
-            updated_db = True
-            camera_config = self.config.cameras[camera]
-            width = camera_config.detect.width
-            height = camera_config.detect.height
-            
-            # Get first pose detector if available
-            first_detector = None
-            if self.config.pose_detectors:
-                first_detector = list(self.config.pose_detectors.values())[0]
-
-            start_time = event_data["start_time"]
-            end_time = (
-                None if event_data["end_time"] is None else event_data["end_time"]
-            )
-            
-            # Score and pose data
-            score = event_data.get("score", 0)
-            top_score = event_data.get("top_score", score)
-            pose_data = event_data.get("pose_data", {})
-            
-            # Keep these from being set back to false
-            if self.events_in_process[event_data["id"]]["has_clip"]:
-                event_data["has_clip"] = True
-            if self.events_in_process[event_data["id"]]["has_snapshot"]:
-                event_data["has_snapshot"] = True
-
-            event = {
-                Event.id: event_data["id"],
-                Event.label: "pose",
-                Event.camera: camera,
-                Event.start_time: start_time,
-                Event.end_time: end_time,
-                Event.zones: list(event_data.get("zones", [])),
-                Event.thumbnail: event_data.get("thumbnail"),
-                Event.has_clip: event_data["has_clip"],
-                Event.has_snapshot: event_data["has_snapshot"],
-                Event.data: {
-                    "score": score,
-                    "top_score": top_score,
-                    "type": "pose",
-                    "pose_data": pose_data,
-                    "actions": event_data.get("actions", []),
-                },
-            }
-            
-            # Add detector info if available
-            if first_detector:
-                event[Event.model_hash] = first_detector.model.model_hash
-                event[Event.model_type] = first_detector.model.model_type
-                event[Event.detector_type] = first_detector.type
-
-            # Set sub_label from actions if available
-            actions = event_data.get("actions", [])
-            if actions:
-                event[Event.sub_label] = ", ".join(actions)
-
-            (
-                Event.insert(event)
-                .on_conflict(
-                    conflict_target=[Event.id],
-                    update=event,
-                )
-                .execute()
-            )
-
-        # Check if the stored event_data should be updated
-        if updated_db or should_update_state(
-            self.events_in_process[event_data["id"]], event_data
-        ):
-            self.events_in_process[event_data["id"]] = event_data
-
-        if event_type == EventStateEnum.end:
-            del self.events_in_process[event_data["id"]]
-            self.event_end_publisher.publish((event_data["id"], camera, updated_db))

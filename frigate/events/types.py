@@ -6,7 +6,7 @@ from enum import Enum
 class EventTypeEnum(str, Enum):
     api = "api"
     tracked_object = "tracked_object"
-    pose = "pose"
+    tracked_pose = "tracked_pose"
 
 
 class EventStateEnum(str, Enum):

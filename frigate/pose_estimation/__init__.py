@@ -1,1 +1,0 @@
-# Pose estimation module initialization

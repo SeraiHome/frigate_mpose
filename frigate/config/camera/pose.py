@@ -1,122 +1,75 @@
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Set
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import Field
 
 from frigate.config.base import FrigateBaseModel
+from frigate.events.pose_types import PoseActionTypeEnum
 
 
-class PoseFilterConfig(BaseModel):
-    """Filter configuration for specific pose types."""
-    min_keypoints: int = Field(
-        default=5,
-        ge=1,
-        le=17,
-        description="Minimum number of visible keypoints to consider a valid pose"
+class PoseFilterConfig(FrigateBaseModel):
+    min_area: int = Field(default=0, title="Minimum pose area in pixels.")
+    max_area: int = Field(default=24000000, title="Maximum pose area in pixels.")
+    min_ratio: float = Field(
+        default=0, title="Minimum width/height ratio for pose bounding box."
     )
-    min_confidence: float = Field(
-        default=0.4,
-        ge=0.0,
-        le=1.0,
-        description="Minimum confidence score for pose detection"
+    max_ratio: float = Field(
+        default=24000000, title="Maximum width/height ratio for pose bounding box."
     )
-    min_area: Optional[int] = Field(
-        default=None,
-        ge=0,
-        description="Minimum area of bounding box for pose"
+    threshold: float = Field(
+        default=0.4, title="Minimum confidence threshold for pose detection."
     )
-    max_area: Optional[int] = Field(
-        default=None,
-        ge=0,
-        description="Maximum area of bounding box for pose"
-    )
-    required_zones: List[str] = Field(
-        default_factory=list,
-        description="List of required zones for pose to be considered"
-    )
-
-
-class PoseActionConfig(BaseModel):
-    """Configuration for pose action detection."""
-    enabled: bool = Field(default=False, description="Enable pose action detection")
-    actions: List[str] = Field(
-        default_factory=lambda: ["falling", "fighting", "running"],
-        description="List of actions to detect"
-    )
-    action_threshold: float = Field(
-        default=0.7,
-        ge=0.0,
-        le=1.0,
-        description="Confidence threshold for action detection"
+    min_score: float = Field(
+        default=0.4, title="Minimum score for pose to be considered valid."
     )
 
 
 class PoseConfig(FrigateBaseModel):
-    """Pose detection configuration for a camera."""
-    enabled: bool = Field(default=False, description="Enable pose detection")
-    
-    width: Optional[int] = Field(
-        default=None,
-        ge=32,
-        le=3840,
-        description="Width of pose detection region"
+    enabled: bool = Field(default=False, title="Enable pose detection for camera.")
+    confidence_threshold: float = Field(
+        default=0.4, title="Minimum confidence threshold for pose detection."
     )
-    height: Optional[int] = Field(
-        default=None,
-        ge=32,
-        le=2160,
-        description="Height of pose detection region"
+    keypoint_threshold: float = Field(
+        default=0.3, title="Minimum confidence threshold for individual keypoints."
     )
-    
-    fps: int = Field(
-        default=5,
-        ge=1,
-        le=30,
-        description="Frames per second for pose detection"
+    actions: Set[PoseActionTypeEnum] = Field(
+        default_factory=lambda: {
+            PoseActionTypeEnum.standing,
+            PoseActionTypeEnum.walking,
+            PoseActionTypeEnum.sitting,
+            PoseActionTypeEnum.lying,
+        },
+        title="Pose actions to track.",
     )
-    
-    max_disappeared: int = Field(
-        default=25,
-        ge=1,
-        description="Maximum frames a pose can disappear before being removed"
+    snapshot_actions: Set[PoseActionTypeEnum] = Field(
+        default_factory=lambda: {
+            PoseActionTypeEnum.waving,
+            PoseActionTypeEnum.pointing,
+        },
+        title="Pose actions that trigger snapshots.",
     )
-    
+    record_actions: Set[PoseActionTypeEnum] = Field(
+        default_factory=lambda: {
+            PoseActionTypeEnum.walking,
+            PoseActionTypeEnum.running,
+            PoseActionTypeEnum.jumping,
+        },
+        title="Pose actions that trigger recording retention.",
+    )
     filters: Dict[str, PoseFilterConfig] = Field(
-        default_factory=lambda: {"person": PoseFilterConfig()},
-        description="Filters for different pose types"
+        default_factory=dict, title="Filters for specific pose actions."
     )
-    
-    track: List[str] = Field(
-        default_factory=lambda: ["person"],
-        description="List of pose types to track"
-    )
-    
-    actions: PoseActionConfig = Field(
-        default_factory=PoseActionConfig,
-        description="Pose action detection configuration"
-    )
-    
+    mask: str = Field(default="", title="Pose detection mask.")
     required_zones: List[str] = Field(
         default_factory=list,
-        description="List of zones where pose detection is required"
+        title="List of required zones for pose detection to trigger events.",
+    )
+    fps: int = Field(
+        default=5, title="FPS for pose detection (should be <= camera detect fps)."
     )
     
-    objects_as_poses: bool = Field(
-        default=False,
-        description="Convert detected person objects to poses for tracking"
-    )
-    
-    keypoint_threshold: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=1.0,
-        description="Minimum confidence for individual keypoints"
-    )
-    
-    @field_validator("track")
-    def validate_track(cls, value: List[str]) -> List[str]:
-        """Validate tracked pose types."""
-        valid_types = ["person", "animal"]  # Can be extended
-        for pose_type in value:
-            if pose_type not in valid_types:
-                raise ValueError(f"Invalid pose type: {pose_type}. Valid types: {valid_types}")
-        return value
+    def __init__(self, **config):
+        super().__init__(**config)
+        
+        # Ensure pose detection fps doesn't exceed reasonable limits
+        if self.fps > 10:
+            self.fps = 10

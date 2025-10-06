@@ -93,6 +93,9 @@ class CameraConfig(FrigateBaseModel):
     objects: ObjectConfig = Field(
         default_factory=ObjectConfig, title="Object configuration."
     )
+    pose: PoseConfig = Field(
+        default_factory=PoseConfig, title="Pose detection configuration."
+    )
     record: RecordConfig = Field(
         default_factory=RecordConfig, title="Record configuration."
     )
@@ -123,9 +126,6 @@ class CameraConfig(FrigateBaseModel):
     )
     onvif: OnvifConfig = Field(
         default_factory=OnvifConfig, title="Camera Onvif Configuration."
-    )
-    pose: PoseConfig = Field(
-        default_factory=PoseConfig, title="Pose detection configuration."
     )
     type: CameraTypeEnum = Field(default=CameraTypeEnum.generic, title="Camera Type")
     ui: CameraUiConfig = Field(

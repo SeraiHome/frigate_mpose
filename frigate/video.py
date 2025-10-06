@@ -7,7 +7,7 @@ import threading
 import time
 from multiprocessing import Queue, Value
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any, Optional
+from typing import Any
 
 import cv2
 
@@ -29,7 +29,6 @@ from frigate.log import LogPipe
 from frigate.motion import MotionDetector
 from frigate.motion.improved_motion import ImprovedMotionDetector
 from frigate.object_detection.base import RemoteObjectDetector
-from frigate.pose_estimation.pose_integration import PoseDetectionIntegration
 from frigate.ptz.autotrack import ptz_moving_at_frame_time
 from frigate.track import ObjectTracker
 from frigate.track.norfair_tracker import NorfairTracker
@@ -523,10 +522,6 @@ class CameraTracker(FrigateProcess):
         ptz_metrics: PTZMetrics,
         region_grid: list[list[dict[str, Any]]],
         stop_event: MpEvent,
-        pose_detection_queue: Queue = None,
-        pose_event_queue: Queue = None,
-        timeline_queue: Queue = None,
-        frigate_config = None,
     ) -> None:
         super().__init__(
             stop_event,
@@ -542,10 +537,6 @@ class CameraTracker(FrigateProcess):
         self.camera_metrics = camera_metrics
         self.ptz_metrics = ptz_metrics
         self.region_grid = region_grid
-        self.pose_detection_queue = pose_detection_queue
-        self.pose_event_queue = pose_event_queue
-        self.timeline_queue = timeline_queue
-        self.frigate_config = frigate_config
 
     def run(self) -> None:
         self.pre_run_setup()
@@ -573,19 +564,6 @@ class CameraTracker(FrigateProcess):
 
         # create communication for region grid updates
         requestor = InterProcessRequestor()
-        
-        # create pose detection integration if enabled
-        pose_integration = None
-        if self.config.pose.enabled and self.pose_detection_queue and self.frigate_config:
-            pose_integration = PoseDetectionIntegration(
-                self.config,
-                self.frigate_config,
-                self.pose_detection_queue,
-                self.pose_event_queue,
-                self.timeline_queue,
-                self.camera_metrics,
-                self.stop_event,
-            )
 
         process_frames(
             requestor,
@@ -602,7 +580,6 @@ class CameraTracker(FrigateProcess):
             self.stop_event,
             self.ptz_metrics,
             self.region_grid,
-            pose_integration=pose_integration,
         )
 
         # empty the frame queue
@@ -610,10 +587,6 @@ class CameraTracker(FrigateProcess):
         while not frame_queue.empty():
             (frame_name, _) = frame_queue.get(False)
             frame_manager.delete(frame_name)
-
-        # cleanup pose integration
-        if pose_integration:
-            pose_integration.cleanup()
 
         logger.info(f"{self.config.name}: exiting subprocess")
 
@@ -671,7 +644,6 @@ def process_frames(
     ptz_metrics: PTZMetrics,
     region_grid: list[list[dict[str, Any]]],
     exit_on_empty: bool = False,
-    pose_integration: Optional[PoseDetectionIntegration] = None,
 ):
     next_region_update = get_tomorrow_at_time(2)
     config_subscriber = CameraConfigUpdateSubscriber(
@@ -1023,25 +995,6 @@ def process_frames(
                 f"debug/frames/{camera_config.name}-{'{:.6f}'.format(frame_time)}.jpg",
                 bgr_frame,
             )
-        # Process pose detection if enabled
-        pose_detections = []
-        if pose_integration and camera_config.pose.enabled:
-            try:
-                # Get list of tracked objects for conversion
-                tracked_objects_list = list(detections.values())
-                
-                # Process frame for pose detection
-                pose_detections = pose_integration.process_frame(
-                    frame,
-                    frame_time,
-                    motion_boxes,
-                    regions,
-                    tracked_objects_list,
-                    [],  # current zones - TODO: get actual zones
-                )
-            except Exception as e:
-                logger.error(f"Error in pose detection: {e}")
-
         # add to the queue if not full
         if detected_objects_queue.full():
             frame_manager.close(frame_name)

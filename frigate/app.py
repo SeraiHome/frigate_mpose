@@ -62,6 +62,7 @@ from frigate.models import (
 )
 from frigate.object_detection.base import ObjectDetectProcess
 from frigate.output.output import OutputProcess
+from frigate.pose_detection.base import PoseDetectProcess
 from frigate.ptz.autotrack import PtzAutoTrackerThread
 from frigate.ptz.onvif import OnvifController
 from frigate.record.cleanup import RecordingCleanup
@@ -92,6 +93,9 @@ class FrigateApp:
         self.detection_queue: Queue = mp.Queue()
         self.detectors: dict[str, ObjectDetectProcess] = {}
         self.detection_shms: list[mp.shared_memory.SharedMemory] = []
+        self.pose_detection_queue: Queue = mp.Queue()
+        self.pose_detectors: dict[str, PoseDetectProcess] = {}
+        self.pose_detection_shms: list[mp.shared_memory.SharedMemory] = []
         self.log_queue: Queue = mp.Queue()
         self.camera_metrics: DictProxy = self.metrics_manager.dict()
         self.embeddings_metrics: DataProcessorMetrics | None = (
@@ -376,6 +380,56 @@ class FrigateApp:
                 self.stop_event,
             )
 
+    def start_pose_detectors(self) -> None:
+        # Only start pose detectors if at least one camera has pose detection enabled
+        pose_enabled_cameras = [
+            name for name, camera_config in self.config.cameras.items()
+            if camera_config.pose.enabled
+        ]
+        
+        if not pose_enabled_cameras:
+            logger.info("No cameras have pose detection enabled, skipping pose detectors")
+            return
+
+        for name in pose_enabled_cameras:
+            try:
+                # Calculate the largest pose frame size, defaulting to 320 if no detectors
+                pose_frame_sizes = [
+                    det.model.height * det.model.width * 3
+                    if det.model is not None
+                    else 320
+                    for det in self.config.pose_detectors.values()
+                ]
+                largest_pose_frame = max(pose_frame_sizes) if pose_frame_sizes else 320
+                shm_in = UntrackedSharedMemory(
+                    name=f"pose-{name}",
+                    create=True,
+                    size=largest_pose_frame,
+                )
+            except FileExistsError:
+                shm_in = UntrackedSharedMemory(name=f"pose-{name}")
+
+            try:
+                # Pose output: person_id(1) + confidence(1) + keypoints(17*3=51) + bbox(4) = 57 floats
+                shm_out = UntrackedSharedMemory(
+                    name=f"pose-out-{name}", create=True, size=20 * 57 * 4
+                )
+            except FileExistsError:
+                shm_out = UntrackedSharedMemory(name=f"pose-out-{name}")
+
+            self.pose_detection_shms.append(shm_in)
+            self.pose_detection_shms.append(shm_out)
+
+        for name, pose_detector_config in self.config.pose_detectors.items():
+            self.pose_detectors[name] = PoseDetectProcess(
+                name,
+                self.pose_detection_queue,
+                pose_enabled_cameras,
+                self.config,
+                pose_detector_config,
+                self.stop_event,
+            )
+
     def start_ptz_autotracker(self) -> None:
         self.ptz_autotracker_thread = PtzAutoTrackerThread(
             self.config,
@@ -537,6 +591,7 @@ class FrigateApp:
         self.check_db_data_migrations()
         self.init_inter_process_communicator()
         self.start_detectors()
+        self.start_pose_detectors()
         self.init_dispatcher()
         self.init_embeddings_client()
         self.start_video_output_processor()
@@ -603,8 +658,15 @@ class FrigateApp:
         for detector in self.detectors.values():
             detector.stop()
 
+        # ensure the pose detectors are done
+        for pose_detector in self.pose_detectors.values():
+            pose_detector.stop()
+
         empty_and_close_queue(self.detection_queue)
         logger.info("Detection queue closed")
+        
+        empty_and_close_queue(self.pose_detection_queue)
+        logger.info("Pose detection queue closed")
 
         self.detected_frames_processor.join()
         empty_and_close_queue(self.detected_frames_queue)

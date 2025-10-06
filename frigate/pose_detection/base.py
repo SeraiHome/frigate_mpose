@@ -7,21 +7,20 @@ from abc import ABC, abstractmethod
 from collections import deque
 from multiprocessing import Queue, Value
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from frigate.comms.object_detector_signaler import (
-    ObjectDetectorPublisher,
-    ObjectDetectorSubscriber,
+from frigate.comms.pose_detector_signaler import (
+    PoseDetectorPublisher,
+    PoseDetectorSubscriber,
 )
 from frigate.config import FrigateConfig
 from frigate.const import PROCESS_PRIORITY_HIGH
-from frigate.detectors import create_detector
-from frigate.detectors.detector_config import (
-    BaseDetectorConfig,
+from frigate.pose_detectors import create_pose_detector
+from frigate.pose_detectors.detector_config import (
+    BasePoseDetectorConfig,
     InputDTypeEnum,
-    ModelConfig,
+    PoseModelConfig,
 )
 from frigate.util.builtin import EventsPerSecond, load_labels
 from frigate.util.image import SharedMemoryFrameManager, UntrackedSharedMemory
@@ -32,49 +31,16 @@ from .util import tensor_transform
 logger = logging.getLogger(__name__)
 
 
-# Pose keypoint structure
-class PoseKeypoint:
-    def __init__(self, x: float, y: float, confidence: float):
-        self.x = x
-        self.y = y
-        self.confidence = confidence
-
-    def to_dict(self) -> Dict[str, float]:
-        return {"x": self.x, "y": self.y, "confidence": self.confidence}
-
-
-class Pose:
-    def __init__(
-        self,
-        keypoints: List[PoseKeypoint],
-        pose_id: Optional[str] = None,
-        confidence: float = 0.0,
-        bbox: Optional[Tuple[float, float, float, float]] = None,
-    ):
-        self.keypoints = keypoints
-        self.pose_id = pose_id
-        self.confidence = confidence
-        self.bbox = bbox  # (x1, y1, x2, y2)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "pose_id": self.pose_id,
-            "confidence": self.confidence,
-            "bbox": self.bbox,
-            "keypoints": [kp.to_dict() for kp in self.keypoints],
-        }
-
-
 class PoseDetector(ABC):
     @abstractmethod
-    def detect_poses(self, tensor_input, threshold: float = 0.4) -> List[Pose]:
+    def detect(self, tensor_input, threshold: float = 0.4):
         pass
 
 
 class BaseLocalPoseDetector(PoseDetector):
     def __init__(
         self,
-        detector_config: BaseDetectorConfig = None,
+        detector_config: BasePoseDetectorConfig = None,
         labels: str = None,
     ):
         self.fps = EventsPerSecond()
@@ -90,7 +56,7 @@ class BaseLocalPoseDetector(PoseDetector):
             self.input_transform = None
             self.dtype = InputDTypeEnum.int
 
-        self.detect_api = create_detector(detector_config)
+        self.detect_api = create_pose_detector(detector_config)
 
     def _transform_input(self, tensor_input: np.ndarray) -> np.ndarray:
         if self.input_transform:
@@ -104,34 +70,23 @@ class BaseLocalPoseDetector(PoseDetector):
 
         return tensor_input
 
-    def detect_poses(self, tensor_input: np.ndarray, threshold=0.4) -> List[Pose]:
+    def detect(self, tensor_input: np.ndarray, threshold=0.4):
         poses = []
 
         raw_poses = self.detect_raw(tensor_input)
 
-        for pose_data in raw_poses:
-            # Process pose data based on the model output format
-            # This is a placeholder - actual implementation depends on model
-            if pose_data.get("confidence", 0) < threshold:
-                continue
-            
-            keypoints = []
-            for kp in pose_data.get("keypoints", []):
-                keypoints.append(PoseKeypoint(kp[0], kp[1], kp[2]))
-            
-            pose = Pose(
-                keypoints=keypoints,
-                confidence=pose_data.get("confidence", 0),
-                bbox=pose_data.get("bbox"),
-            )
-            poses.append(pose)
-        
+        for pose in raw_poses:
+            # pose format: [person_id, confidence, keypoints...]
+            if pose[1] < threshold:
+                break
+            poses.append({
+                'person_id': int(pose[0]),
+                'confidence': float(pose[1]),
+                'keypoints': pose[2:].reshape(-1, 3),  # reshape to (num_keypoints, 3) for x,y,confidence
+                'bbox': pose[-4:] if len(pose) > 2 else None  # bounding box if available
+            })
         self.fps.update()
         return poses
-
-    @abstractmethod
-    def detect_raw(self, tensor_input: np.ndarray):
-        pass
 
 
 class LocalPoseDetector(BaseLocalPoseDetector):
@@ -158,7 +113,7 @@ class PoseDetectorRunner(FrigateProcess):
         avg_speed: Value,
         start_time: Value,
         config: FrigateConfig,
-        detector_config: BaseDetectorConfig,
+        detector_config: BasePoseDetectorConfig,
         stop_event: MpEvent,
     ) -> None:
         super().__init__(stop_event, PROCESS_PRIORITY_HIGH, name=name, daemon=True)
@@ -171,16 +126,9 @@ class PoseDetectorRunner(FrigateProcess):
         self.outputs: dict = {}
 
     def create_output_shm(self, name: str):
-        # Create shared memory for pose outputs
-        # Structure: max_poses * (pose_confidence + bbox(4) + num_keypoints * (x, y, confidence))
-        # Assuming max 5 poses, 17 keypoints (COCO format)
-        max_poses = 5
-        keypoints_per_pose = 17
-        values_per_keypoint = 3  # x, y, confidence
-        values_per_pose = 1 + 4 + keypoints_per_pose * values_per_keypoint  # confidence + bbox + keypoints
-        
-        out_shm = UntrackedSharedMemory(name=f"pose-out-{name}", create=True)
-        out_np = np.ndarray((max_poses, values_per_pose), dtype=np.float32, buffer=out_shm.buf)
+        # Pose detection output: person_id, confidence, keypoints (17*3=51), bbox (4) = 57 floats max
+        out_shm = UntrackedSharedMemory(name=f"pose-out-{name}", create=False)
+        out_np = np.ndarray((20, 57), dtype=np.float32, buffer=out_shm.buf)
         self.outputs[name] = {"shm": out_shm, "np": out_np}
 
     def run(self) -> None:
@@ -188,7 +136,7 @@ class PoseDetectorRunner(FrigateProcess):
 
         frame_manager = SharedMemoryFrameManager()
         pose_detector = LocalPoseDetector(detector_config=self.detector_config)
-        detector_publisher = ObjectDetectorPublisher()
+        detector_publisher = PoseDetectorPublisher()
 
         for name in self.cameras:
             self.create_output_shm(name)
@@ -214,19 +162,15 @@ class PoseDetectorRunner(FrigateProcess):
 
             # detect and send the output
             self.start_time.value = datetime.datetime.now().timestamp()
-            raw_poses = pose_detector.detect_raw(input_frame)
+            poses = pose_detector.detect_raw(input_frame)
             duration = datetime.datetime.now().timestamp() - self.start_time.value
             frame_manager.close(connection_id)
 
             if connection_id not in self.outputs:
                 self.create_output_shm(connection_id)
 
-            # Convert pose data to numpy array format
-            # This is a placeholder - actual format depends on model output
-            self.outputs[connection_id]["np"][:] = 0  # Clear previous data
-            # TODO: Fill with actual pose data
-            
-            detector_publisher.publish(f"pose-{connection_id}")
+            self.outputs[connection_id]["np"][:] = poses[:]
+            detector_publisher.publish(connection_id)
             self.start_time.value = 0.0
 
             self.avg_speed.value = (self.avg_speed.value * 9 + duration) / 10
@@ -244,7 +188,7 @@ class AsyncPoseDetectorRunner(FrigateProcess):
         avg_speed: Value,
         start_time: Value,
         config: FrigateConfig,
-        detector_config: BaseDetectorConfig,
+        detector_config: BasePoseDetectorConfig,
         stop_event: MpEvent,
     ) -> None:
         super().__init__(stop_event, PROCESS_PRIORITY_HIGH, name=name, daemon=True)
@@ -256,19 +200,13 @@ class AsyncPoseDetectorRunner(FrigateProcess):
         self.detector_config = detector_config
         self.outputs: dict = {}
         self._frame_manager: SharedMemoryFrameManager | None = None
-        self._publisher: ObjectDetectorPublisher | None = None
+        self._publisher: PoseDetectorPublisher | None = None
         self._detector: AsyncLocalPoseDetector | None = None
         self.send_times = deque()
 
     def create_output_shm(self, name: str):
-        # Same as PoseDetectorRunner
-        max_poses = 5
-        keypoints_per_pose = 17
-        values_per_keypoint = 3
-        values_per_pose = 1 + 4 + keypoints_per_pose * values_per_keypoint
-        
-        out_shm = UntrackedSharedMemory(name=f"pose-out-{name}", create=True)
-        out_np = np.ndarray((max_poses, values_per_pose), dtype=np.float32, buffer=out_shm.buf)
+        out_shm = UntrackedSharedMemory(name=f"pose-out-{name}", create=False)
+        out_np = np.ndarray((20, 57), dtype=np.float32, buffer=out_shm.buf)
         self.outputs[name] = {"shm": out_shm, "np": out_np}
 
     def _detect_worker(self) -> None:
@@ -316,9 +254,8 @@ class AsyncPoseDetectorRunner(FrigateProcess):
 
             # write results and publish
             if poses is not None:
-                self.outputs[connection_id]["np"][:] = 0  # Clear previous data
-                # TODO: Fill with actual pose data
-            self._publisher.publish(f"pose-{connection_id}")
+                self.outputs[connection_id]["np"][:] = poses[:]
+            self._publisher.publish(connection_id)
 
             # update timers
             self.avg_speed.value = (self.avg_speed.value * 9 + duration) / 10
@@ -328,7 +265,7 @@ class AsyncPoseDetectorRunner(FrigateProcess):
         self.pre_run_setup(self.config.logger)
 
         self._frame_manager = SharedMemoryFrameManager()
-        self._publisher = ObjectDetectorPublisher()
+        self._publisher = PoseDetectorPublisher()
         self._detector = AsyncLocalPoseDetector(detector_config=self.detector_config)
 
         for name in self.cameras:
@@ -353,7 +290,7 @@ class PoseDetectProcess:
         detection_queue: Queue,
         cameras: list[str],
         config: FrigateConfig,
-        detector_config: BaseDetectorConfig,
+        detector_config: BasePoseDetectorConfig,
         stop_event: MpEvent,
     ):
         self.name = name
@@ -385,7 +322,7 @@ class PoseDetectProcess:
         if (self.detect_process is not None) and self.detect_process.is_alive():
             self.stop()
 
-        # Async path for MemryX
+        # Async path for MemryX and other async detectors
         if self.detector_config.type == "memryx":
             self.detect_process = AsyncPoseDetectorRunner(
                 f"frigate.pose_detector:{self.name}",
@@ -417,7 +354,7 @@ class RemotePoseDetector:
         name: str,
         labels: dict[int, str],
         detection_queue: Queue,
-        model_config: ModelConfig,
+        model_config: PoseModelConfig,
         stop_event: MpEvent,
     ):
         self.labels = labels
@@ -425,24 +362,17 @@ class RemotePoseDetector:
         self.fps = EventsPerSecond()
         self.detection_queue = detection_queue
         self.stop_event = stop_event
-        self.shm = UntrackedSharedMemory(name=f"pose-{self.name}", create=True)
+        self.shm = UntrackedSharedMemory(name=self.name, create=False)
         self.np_shm = np.ndarray(
             (1, model_config.height, model_config.width, 3),
             dtype=np.uint8,
             buffer=self.shm.buf,
         )
-        
-        # Output shared memory for poses
-        max_poses = 5
-        keypoints_per_pose = 17
-        values_per_keypoint = 3
-        values_per_pose = 1 + 4 + keypoints_per_pose * values_per_keypoint
-        
-        self.out_shm = UntrackedSharedMemory(name=f"pose-out-{self.name}", create=True)
-        self.out_np_shm = np.ndarray((max_poses, values_per_pose), dtype=np.float32, buffer=self.out_shm.buf)
-        self.detector_subscriber = ObjectDetectorSubscriber(f"pose-{name}")
+        self.out_shm = UntrackedSharedMemory(name=f"pose-out-{self.name}", create=False)
+        self.out_np_shm = np.ndarray((20, 57), dtype=np.float32, buffer=self.out_shm.buf)
+        self.detector_subscriber = PoseDetectorSubscriber(name)
 
-    def detect_poses(self, tensor_input, threshold=0.4) -> List[Pose]:
+    def detect(self, tensor_input, threshold=0.4):
         poses = []
 
         if self.stop_event.is_set():
@@ -450,22 +380,22 @@ class RemotePoseDetector:
 
         # copy input to shared memory
         self.np_shm[:] = tensor_input[:]
-        self.detection_queue.put(f"pose-{self.name}")
+        self.detection_queue.put(self.name)
         result = self.detector_subscriber.check_for_update()
 
         # if it timed out
         if result is None:
             return poses
 
-        # Parse pose data from shared memory
-        # TODO: Implement actual parsing based on the data format
         for pose_data in self.out_np_shm:
-            if pose_data[0] < threshold:  # confidence check
+            if pose_data[1] < threshold:
                 break
-            
-            # Extract keypoints and bbox from pose_data
-            # This is a placeholder - actual implementation depends on data format
-            
+            poses.append({
+                'person_id': int(pose_data[0]),
+                'confidence': float(pose_data[1]),
+                'keypoints': pose_data[2:53].reshape(-1, 3),  # 17 keypoints * 3 = 51
+                'bbox': pose_data[53:57] if len(pose_data) > 53 else None
+            })
         self.fps.update()
         return poses
 
