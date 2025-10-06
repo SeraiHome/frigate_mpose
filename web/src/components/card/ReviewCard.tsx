@@ -109,7 +109,6 @@ export default function ReviewCard({
 
   useKeyboardListener(["Shift"], (_, modifiers) => {
     bypassDialogRef.current = modifiers.shift;
-    return false;
   });
 
   const handleDelete = useCallback(() => {

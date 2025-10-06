@@ -7,12 +7,11 @@ import numpy as np
 
 from frigate.comms.inter_process import InterProcessRequestor
 from frigate.const import MODEL_CACHE_DIR
-from frigate.detectors.detection_runners import BaseModelRunner, get_optimized_runner
-from frigate.embeddings.types import EnrichmentModelTypeEnum
 from frigate.types import ModelStatusTypesEnum
 from frigate.util.downloader import ModelDownloader
 
 from .base_embedding import BaseEmbedding
+from .runner import ONNXModelRunner
 
 warnings.filterwarnings(
     "ignore",
@@ -33,23 +32,22 @@ class PaddleOCRDetection(BaseEmbedding):
         device: str = "AUTO",
     ):
         model_file = (
-            "detection_v3-large.onnx"
+            "detection_v5-large.onnx"
             if model_size == "large"
             else "detection_v5-small.onnx"
         )
-        GITHUB_ENDPOINT = os.environ.get("GITHUB_ENDPOINT", "https://github.com")
         super().__init__(
             model_name="paddleocr-onnx",
             model_file=model_file,
             download_urls={
-                model_file: f"{GITHUB_ENDPOINT}/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/{'v3' if model_size == 'large' else 'v5'}/{model_file}"
+                model_file: f"https://github.com/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/v5/{model_file}"
             },
         )
         self.requestor = requestor
         self.model_size = model_size
         self.device = device
         self.download_path = os.path.join(MODEL_CACHE_DIR, self.model_name)
-        self.runner: BaseModelRunner | None = None
+        self.runner: ONNXModelRunner | None = None
         files_names = list(self.download_urls.keys())
         if not all(
             os.path.exists(os.path.join(self.download_path, n)) for n in files_names
@@ -78,10 +76,10 @@ class PaddleOCRDetection(BaseEmbedding):
             if self.downloader:
                 self.downloader.wait_for_download()
 
-            self.runner = get_optimized_runner(
+            self.runner = ONNXModelRunner(
                 os.path.join(self.download_path, self.model_file),
                 self.device,
-                model_type=EnrichmentModelTypeEnum.paddleocr.value,
+                self.model_size,
             )
 
     def _preprocess_inputs(self, raw_inputs):
@@ -98,19 +96,18 @@ class PaddleOCRClassification(BaseEmbedding):
         requestor: InterProcessRequestor,
         device: str = "AUTO",
     ):
-        GITHUB_ENDPOINT = os.environ.get("GITHUB_ENDPOINT", "https://github.com")
         super().__init__(
             model_name="paddleocr-onnx",
             model_file="classification.onnx",
             download_urls={
-                "classification.onnx": f"{GITHUB_ENDPOINT}/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/classification.onnx"
+                "classification.onnx": "https://github.com/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/classification.onnx"
             },
         )
         self.requestor = requestor
         self.model_size = model_size
         self.device = device
         self.download_path = os.path.join(MODEL_CACHE_DIR, self.model_name)
-        self.runner: BaseModelRunner | None = None
+        self.runner: ONNXModelRunner | None = None
         files_names = list(self.download_urls.keys())
         if not all(
             os.path.exists(os.path.join(self.download_path, n)) for n in files_names
@@ -139,10 +136,10 @@ class PaddleOCRClassification(BaseEmbedding):
             if self.downloader:
                 self.downloader.wait_for_download()
 
-            self.runner = get_optimized_runner(
+            self.runner = ONNXModelRunner(
                 os.path.join(self.download_path, self.model_file),
                 self.device,
-                model_type=EnrichmentModelTypeEnum.paddleocr.value,
+                self.model_size,
             )
 
     def _preprocess_inputs(self, raw_inputs):
@@ -159,20 +156,19 @@ class PaddleOCRRecognition(BaseEmbedding):
         requestor: InterProcessRequestor,
         device: str = "AUTO",
     ):
-        GITHUB_ENDPOINT = os.environ.get("GITHUB_ENDPOINT", "https://github.com")
         super().__init__(
             model_name="paddleocr-onnx",
             model_file="recognition_v4.onnx",
             download_urls={
-                "recognition_v4.onnx": f"{GITHUB_ENDPOINT}/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/v4/recognition_v4.onnx",
-                "ppocr_keys_v1.txt": f"{GITHUB_ENDPOINT}/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/v4/ppocr_keys_v1.txt",
+                "recognition_v4.onnx": "https://github.com/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/v4/recognition_v4.onnx",
+                "ppocr_keys_v1.txt": "https://github.com/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/v4/ppocr_keys_v1.txt",
             },
         )
         self.requestor = requestor
         self.model_size = model_size
         self.device = device
         self.download_path = os.path.join(MODEL_CACHE_DIR, self.model_name)
-        self.runner: BaseModelRunner | None = None
+        self.runner: ONNXModelRunner | None = None
         files_names = list(self.download_urls.keys())
         if not all(
             os.path.exists(os.path.join(self.download_path, n)) for n in files_names
@@ -201,10 +197,10 @@ class PaddleOCRRecognition(BaseEmbedding):
             if self.downloader:
                 self.downloader.wait_for_download()
 
-            self.runner = get_optimized_runner(
+            self.runner = ONNXModelRunner(
                 os.path.join(self.download_path, self.model_file),
                 self.device,
-                model_type=EnrichmentModelTypeEnum.paddleocr.value,
+                self.model_size,
             )
 
     def _preprocess_inputs(self, raw_inputs):
@@ -221,12 +217,11 @@ class LicensePlateDetector(BaseEmbedding):
         requestor: InterProcessRequestor,
         device: str = "AUTO",
     ):
-        GITHUB_ENDPOINT = os.environ.get("GITHUB_ENDPOINT", "https://github.com")
         super().__init__(
             model_name="yolov9_license_plate",
             model_file="yolov9-256-license-plates.onnx",
             download_urls={
-                "yolov9-256-license-plates.onnx": f"{GITHUB_ENDPOINT}/hawkeye217/yolov9-license-plates/raw/refs/heads/master/models/yolov9-256-license-plates.onnx"
+                "yolov9-256-license-plates.onnx": "https://github.com/hawkeye217/yolov9-license-plates/raw/refs/heads/master/models/yolov9-256-license-plates.onnx"
             },
         )
 
@@ -234,7 +229,7 @@ class LicensePlateDetector(BaseEmbedding):
         self.model_size = model_size
         self.device = device
         self.download_path = os.path.join(MODEL_CACHE_DIR, self.model_name)
-        self.runner: BaseModelRunner | None = None
+        self.runner: ONNXModelRunner | None = None
         files_names = list(self.download_urls.keys())
         if not all(
             os.path.exists(os.path.join(self.download_path, n)) for n in files_names
@@ -263,10 +258,10 @@ class LicensePlateDetector(BaseEmbedding):
             if self.downloader:
                 self.downloader.wait_for_download()
 
-            self.runner = get_optimized_runner(
+            self.runner = ONNXModelRunner(
                 os.path.join(self.download_path, self.model_file),
                 self.device,
-                model_type=EnrichmentModelTypeEnum.yolov9_license_plate.value,
+                self.model_size,
             )
 
     def _preprocess_inputs(self, raw_inputs):

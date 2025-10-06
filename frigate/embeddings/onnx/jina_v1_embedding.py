@@ -4,21 +4,19 @@ import logging
 import os
 import warnings
 
+# importing this without pytorch or others causes a warning
+# https://github.com/huggingface/transformers/issues/27214
+# suppressed by setting env TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 from transformers import AutoFeatureExtractor, AutoTokenizer
 from transformers.utils.logging import disable_progress_bar
 
 from frigate.comms.inter_process import InterProcessRequestor
 from frigate.const import MODEL_CACHE_DIR, UPDATE_MODEL_STATE
-from frigate.detectors.detection_runners import BaseModelRunner, get_optimized_runner
-
-# importing this without pytorch or others causes a warning
-# https://github.com/huggingface/transformers/issues/27214
-# suppressed by setting env TRANSFORMERS_NO_ADVISORY_WARNINGS=1
-from frigate.embeddings.types import EnrichmentModelTypeEnum
 from frigate.types import ModelStatusTypesEnum
 from frigate.util.downloader import ModelDownloader
 
 from .base_embedding import BaseEmbedding
+from .runner import ONNXModelRunner
 
 warnings.filterwarnings(
     "ignore",
@@ -127,10 +125,9 @@ class JinaV1TextEmbedding(BaseEmbedding):
                 clean_up_tokenization_spaces=True,
             )
 
-            self.runner = get_optimized_runner(
+            self.runner = ONNXModelRunner(
                 os.path.join(self.download_path, self.model_file),
                 self.device,
-                model_type=EnrichmentModelTypeEnum.jina_v1.value,
             )
 
     def _preprocess_inputs(self, raw_inputs):
@@ -173,7 +170,7 @@ class JinaV1ImageEmbedding(BaseEmbedding):
         self.device = device
         self.download_path = os.path.join(MODEL_CACHE_DIR, self.model_name)
         self.feature_extractor = None
-        self.runner: BaseModelRunner | None = None
+        self.runner: ONNXModelRunner | None = None
         files_names = list(self.download_urls.keys())
         if not all(
             os.path.exists(os.path.join(self.download_path, n)) for n in files_names
@@ -206,10 +203,9 @@ class JinaV1ImageEmbedding(BaseEmbedding):
                 f"{MODEL_CACHE_DIR}/{self.model_name}",
             )
 
-            self.runner = get_optimized_runner(
+            self.runner = ONNXModelRunner(
                 os.path.join(self.download_path, self.model_file),
                 self.device,
-                model_type=EnrichmentModelTypeEnum.jina_v1.value,
             )
 
     def _preprocess_inputs(self, raw_inputs):

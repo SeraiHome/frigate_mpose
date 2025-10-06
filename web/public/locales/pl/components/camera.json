@@ -66,8 +66,7 @@
         },
         "placeholder": "Wybierz strumień",
         "stream": "Strumień"
-      },
-      "birdseye": "Widok z lotu ptaka"
+      }
     }
   },
   "debug": {

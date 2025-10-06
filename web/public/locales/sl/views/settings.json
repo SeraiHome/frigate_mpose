@@ -8,8 +8,7 @@
     "object": "Odpravljanje napak - Frigate",
     "general": "Splošne Nastavitve - Frigate",
     "frigatePlus": "Frigate+ Nastavitve - Frigate",
-    "enrichments": "Nastavitve Obogatitev - Frigate",
-    "motionTuner": "Nastavitev gibanja - Frigate"
+    "enrichments": "Nastavitve Obogatitev - Frigate"
   },
   "menu": {
     "ui": "Uporabniški vmesnik",
@@ -20,8 +19,7 @@
     "users": "Uporabniki",
     "notifications": "Obvestila",
     "frigateplus": "Frigate+",
-    "motionTuner": "Nastavitev Gibanja",
-    "triggers": "Prožilniki"
+    "motionTuner": "Nastavitev Gibanja"
   },
   "masksAndZones": {
     "zones": {

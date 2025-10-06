@@ -108,9 +108,6 @@
     "playInBackground": {
       "label": "Spill av i bakgrunnen",
       "tips": "Aktiver dette alternativet for å fortsette strømming når spilleren er skjult."
-    },
-    "debug": {
-      "picker": "Strømmevalg er ikke tilgjengelig i feilsøkingsmodus. Feilsøkingsvisningen bruker alltid strømmen som er tildelt deteksjonsrollen."
     }
   },
   "history": {

@@ -3,6 +3,7 @@
 import logging
 import os
 from abc import ABC, abstractmethod
+from enum import Enum
 from io import BytesIO
 from typing import Any
 
@@ -15,6 +16,11 @@ from frigate.types import ModelStatusTypesEnum
 from frigate.util.downloader import ModelDownloader
 
 logger = logging.getLogger(__name__)
+
+
+class EmbeddingTypeEnum(str, Enum):
+    thumbnail = "thumbnail"
+    description = "description"
 
 
 class BaseEmbedding(ABC):

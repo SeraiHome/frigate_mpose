@@ -9,6 +9,7 @@ from .motion import *  # noqa: F403
 from .mqtt import *  # noqa: F403
 from .objects import *  # noqa: F403
 from .onvif import *  # noqa: F403
+from .pose import *  # noqa: F403
 from .record import *  # noqa: F403
 from .review import *  # noqa: F403
 from .snapshots import *  # noqa: F403

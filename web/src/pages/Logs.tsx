@@ -337,7 +337,7 @@ function Logs() {
     ["PageDown", "PageUp", "ArrowDown", "ArrowUp"],
     (key, modifiers) => {
       if (!key || !modifiers.down || !lazyLogWrapperRef.current) {
-        return true;
+        return;
       }
 
       const container =
@@ -346,7 +346,7 @@ function Logs() {
       const logLineHeight = container?.querySelector(".log-line")?.clientHeight;
 
       if (!logLineHeight) {
-        return true;
+        return;
       }
 
       const scrollAmount = key.includes("Page")
@@ -354,7 +354,6 @@ function Logs() {
         : logLineHeight;
       const direction = key.includes("Down") ? 1 : -1;
       container?.scrollBy({ top: scrollAmount * direction });
-      return true;
     },
   );
 

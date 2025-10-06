@@ -261,19 +261,12 @@ class TestHttp(unittest.TestCase):
         assert Recordings.get(Recordings.id == rec_k3_id)
 
 
-def _insert_mock_event(
-    id: str,
-    start: int,
-    end: int,
-    retain: bool,
-    camera: str = "front_door",
-    label: str = "Mock",
-) -> Event:
+def _insert_mock_event(id: str, start: int, end: int, retain: bool) -> Event:
     """Inserts a basic event model with a given id."""
     return Event.insert(
         id=id,
-        label=label,
-        camera=camera,
+        label="Mock",
+        camera="front_door",
         start_time=start,
         end_time=end,
         top_score=100,

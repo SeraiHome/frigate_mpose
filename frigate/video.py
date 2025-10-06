@@ -1,21 +1,18 @@
+import datetime
 import logging
+import os
 import queue
 import subprocess as sp
 import threading
 import time
-from datetime import datetime, timedelta, timezone
 from multiprocessing import Queue, Value
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, Optional
 
 import cv2
 
 from frigate.camera import CameraMetrics, PTZMetrics
 from frigate.comms.inter_process import InterProcessRequestor
-from frigate.comms.recordings_updater import (
-    RecordingsDataSubscriber,
-    RecordingsDataTypeEnum,
-)
 from frigate.config import CameraConfig, DetectConfig, ModelConfig
 from frigate.config.camera.camera import CameraTypeEnum
 from frigate.config.camera.updater import (
@@ -23,6 +20,8 @@ from frigate.config.camera.updater import (
     CameraConfigUpdateSubscriber,
 )
 from frigate.const import (
+    CACHE_DIR,
+    CACHE_SEGMENT_FORMAT,
     PROCESS_PRIORITY_HIGH,
     REQUEST_REGION_GRID,
 )
@@ -30,6 +29,7 @@ from frigate.log import LogPipe
 from frigate.motion import MotionDetector
 from frigate.motion.improved_motion import ImprovedMotionDetector
 from frigate.object_detection.base import RemoteObjectDetector
+from frigate.pose_estimation.pose_integration import PoseDetectionIntegration
 from frigate.ptz.autotrack import ptz_moving_at_frame_time
 from frigate.track import ObjectTracker
 from frigate.track.norfair_tracker import NorfairTracker
@@ -130,7 +130,7 @@ def capture_frames(
 
         fps.value = frame_rate.eps()
         skipped_fps.value = skipped_eps.eps()
-        current_frame.value = datetime.now().timestamp()
+        current_frame.value = datetime.datetime.now().timestamp()
         frame_name = f"{config.name}_frame{frame_index}"
         frame_buffer = frame_manager.write(frame_name)
         try:
@@ -200,11 +200,6 @@ class CameraWatchdog(threading.Thread):
         self.requestor = InterProcessRequestor()
         self.was_enabled = self.config.enabled
 
-        self.segment_subscriber = RecordingsDataSubscriber(RecordingsDataTypeEnum.all)
-        self.latest_valid_segment_time: float = 0
-        self.latest_invalid_segment_time: float = 0
-        self.latest_cache_segment_time: float = 0
-
     def _update_enabled_state(self) -> bool:
         """Fetch the latest config and update enabled state."""
         self.config_subscriber.check_for_updates()
@@ -249,11 +244,6 @@ class CameraWatchdog(threading.Thread):
                 if enabled:
                     self.logger.debug(f"Enabling camera {self.config.name}")
                     self.start_all_ffmpeg()
-
-                    # reset all timestamps
-                    self.latest_valid_segment_time = 0
-                    self.latest_invalid_segment_time = 0
-                    self.latest_cache_segment_time = 0
                 else:
                     self.logger.debug(f"Disabling camera {self.config.name}")
                     self.stop_all_ffmpeg()
@@ -271,37 +261,7 @@ class CameraWatchdog(threading.Thread):
             if not enabled:
                 continue
 
-            while True:
-                update = self.segment_subscriber.check_for_update(timeout=0)
-
-                if update == (None, None):
-                    break
-
-                raw_topic, payload = update
-                if raw_topic and payload:
-                    topic = str(raw_topic)
-                    camera, segment_time, _ = payload
-
-                    if camera != self.config.name:
-                        continue
-
-                    if topic.endswith(RecordingsDataTypeEnum.valid.value):
-                        self.logger.debug(
-                            f"Latest valid recording segment time on {camera}: {segment_time}"
-                        )
-                        self.latest_valid_segment_time = segment_time
-                    elif topic.endswith(RecordingsDataTypeEnum.invalid.value):
-                        self.logger.warning(
-                            f"Invalid recording segment detected for {camera} at {segment_time}"
-                        )
-                        self.latest_invalid_segment_time = segment_time
-                    elif topic.endswith(RecordingsDataTypeEnum.latest.value):
-                        if segment_time is not None:
-                            self.latest_cache_segment_time = segment_time
-                        else:
-                            self.latest_cache_segment_time = 0
-
-            now = datetime.now().timestamp()
+            now = datetime.datetime.now().timestamp()
 
             if not self.capture_thread.is_alive():
                 self.requestor.send_data(f"{self.config.name}/status/detect", "offline")
@@ -339,55 +299,18 @@ class CameraWatchdog(threading.Thread):
                 poll = p["process"].poll()
 
                 if self.config.record.enabled and "record" in p["roles"]:
-                    now_utc = datetime.now().astimezone(timezone.utc)
-
-                    latest_cache_dt = (
-                        datetime.fromtimestamp(
-                            self.latest_cache_segment_time, tz=timezone.utc
+                    latest_segment_time = self.get_latest_segment_datetime(
+                        p.get(
+                            "latest_segment_time",
+                            datetime.datetime.now().astimezone(datetime.timezone.utc),
                         )
-                        if self.latest_cache_segment_time > 0
-                        else now_utc - timedelta(seconds=1)
                     )
 
-                    latest_valid_dt = (
-                        datetime.fromtimestamp(
-                            self.latest_valid_segment_time, tz=timezone.utc
-                        )
-                        if self.latest_valid_segment_time > 0
-                        else now_utc - timedelta(seconds=1)
-                    )
-
-                    latest_invalid_dt = (
-                        datetime.fromtimestamp(
-                            self.latest_invalid_segment_time, tz=timezone.utc
-                        )
-                        if self.latest_invalid_segment_time > 0
-                        else now_utc - timedelta(seconds=1)
-                    )
-
-                    # ensure segments are still being created and that they have valid video data
-                    cache_stale = now_utc > (latest_cache_dt + timedelta(seconds=120))
-                    valid_stale = now_utc > (latest_valid_dt + timedelta(seconds=120))
-                    invalid_stale_condition = (
-                        self.latest_invalid_segment_time > 0
-                        and now_utc > (latest_invalid_dt + timedelta(seconds=120))
-                        and self.latest_valid_segment_time
-                        <= self.latest_invalid_segment_time
-                    )
-                    invalid_stale = invalid_stale_condition
-
-                    if cache_stale or valid_stale or invalid_stale:
-                        if cache_stale:
-                            reason = "No new recording segments were created"
-                        elif valid_stale:
-                            reason = "No new valid recording segments were created"
-                        else:  # invalid_stale
-                            reason = (
-                                "No valid segments created since last invalid segment"
-                            )
-
+                    if datetime.datetime.now().astimezone(datetime.timezone.utc) > (
+                        latest_segment_time + datetime.timedelta(seconds=120)
+                    ):
                         self.logger.error(
-                            f"{reason} for {self.config.name} in the last 120s. Restarting the ffmpeg record process..."
+                            f"No new recording segments were created for {self.config.name} in the last 120s. restarting the ffmpeg record process..."
                         )
                         p["process"] = start_or_restart_ffmpeg(
                             p["cmd"],
@@ -406,7 +329,7 @@ class CameraWatchdog(threading.Thread):
                         self.requestor.send_data(
                             f"{self.config.name}/status/record", "online"
                         )
-                        p["latest_segment_time"] = self.latest_cache_segment_time
+                        p["latest_segment_time"] = latest_segment_time
 
                 if poll is None:
                     continue
@@ -424,7 +347,6 @@ class CameraWatchdog(threading.Thread):
         self.stop_all_ffmpeg()
         self.logpipe.close()
         self.config_subscriber.stop()
-        self.segment_subscriber.stop()
 
     def start_ffmpeg_detect(self):
         ffmpeg_cmd = [
@@ -483,6 +405,33 @@ class CameraWatchdog(threading.Thread):
                 stop_ffmpeg(p["process"], self.logger)
             p["logpipe"].close()
         self.ffmpeg_other_processes.clear()
+
+    def get_latest_segment_datetime(
+        self, latest_segment: datetime.datetime
+    ) -> datetime.datetime:
+        """Checks if ffmpeg is still writing recording segments to cache."""
+        cache_files = sorted(
+            [
+                d
+                for d in os.listdir(CACHE_DIR)
+                if os.path.isfile(os.path.join(CACHE_DIR, d))
+                and d.endswith(".mp4")
+                and not d.startswith("preview_")
+            ]
+        )
+        newest_segment_time = latest_segment
+
+        for file in cache_files:
+            if self.config.name in file:
+                basename = os.path.splitext(file)[0]
+                _, date = basename.rsplit("@", maxsplit=1)
+                segment_time = datetime.datetime.strptime(
+                    date, CACHE_SEGMENT_FORMAT
+                ).astimezone(datetime.timezone.utc)
+                if segment_time > newest_segment_time:
+                    newest_segment_time = segment_time
+
+        return newest_segment_time
 
 
 class CameraCaptureRunner(threading.Thread):
@@ -574,6 +523,10 @@ class CameraTracker(FrigateProcess):
         ptz_metrics: PTZMetrics,
         region_grid: list[list[dict[str, Any]]],
         stop_event: MpEvent,
+        pose_detection_queue: Queue = None,
+        pose_event_queue: Queue = None,
+        timeline_queue: Queue = None,
+        frigate_config = None,
     ) -> None:
         super().__init__(
             stop_event,
@@ -589,6 +542,10 @@ class CameraTracker(FrigateProcess):
         self.camera_metrics = camera_metrics
         self.ptz_metrics = ptz_metrics
         self.region_grid = region_grid
+        self.pose_detection_queue = pose_detection_queue
+        self.pose_event_queue = pose_event_queue
+        self.timeline_queue = timeline_queue
+        self.frigate_config = frigate_config
 
     def run(self) -> None:
         self.pre_run_setup()
@@ -616,6 +573,19 @@ class CameraTracker(FrigateProcess):
 
         # create communication for region grid updates
         requestor = InterProcessRequestor()
+        
+        # create pose detection integration if enabled
+        pose_integration = None
+        if self.config.pose.enabled and self.pose_detection_queue and self.frigate_config:
+            pose_integration = PoseDetectionIntegration(
+                self.config,
+                self.frigate_config,
+                self.pose_detection_queue,
+                self.pose_event_queue,
+                self.timeline_queue,
+                self.camera_metrics,
+                self.stop_event,
+            )
 
         process_frames(
             requestor,
@@ -632,6 +602,7 @@ class CameraTracker(FrigateProcess):
             self.stop_event,
             self.ptz_metrics,
             self.region_grid,
+            pose_integration=pose_integration,
         )
 
         # empty the frame queue
@@ -639,6 +610,10 @@ class CameraTracker(FrigateProcess):
         while not frame_queue.empty():
             (frame_name, _) = frame_queue.get(False)
             frame_manager.delete(frame_name)
+
+        # cleanup pose integration
+        if pose_integration:
+            pose_integration.cleanup()
 
         logger.info(f"{self.config.name}: exiting subprocess")
 
@@ -696,6 +671,7 @@ def process_frames(
     ptz_metrics: PTZMetrics,
     region_grid: list[list[dict[str, Any]]],
     exit_on_empty: bool = False,
+    pose_integration: Optional[PoseDetectionIntegration] = None,
 ):
     next_region_update = get_tomorrow_at_time(2)
     config_subscriber = CameraConfigUpdateSubscriber(
@@ -779,7 +755,10 @@ def process_frames(
             time.sleep(0.1)
             continue
 
-        if datetime.now().astimezone(timezone.utc) > next_region_update:
+        if (
+            datetime.datetime.now().astimezone(datetime.timezone.utc)
+            > next_region_update
+        ):
             region_grid = requestor.send_data(REQUEST_REGION_GRID, camera_config.name)
             next_region_update = get_tomorrow_at_time(2)
 
@@ -1044,6 +1023,25 @@ def process_frames(
                 f"debug/frames/{camera_config.name}-{'{:.6f}'.format(frame_time)}.jpg",
                 bgr_frame,
             )
+        # Process pose detection if enabled
+        pose_detections = []
+        if pose_integration and camera_config.pose.enabled:
+            try:
+                # Get list of tracked objects for conversion
+                tracked_objects_list = list(detections.values())
+                
+                # Process frame for pose detection
+                pose_detections = pose_integration.process_frame(
+                    frame,
+                    frame_time,
+                    motion_boxes,
+                    regions,
+                    tracked_objects_list,
+                    [],  # current zones - TODO: get actual zones
+                )
+            except Exception as e:
+                logger.error(f"Error in pose detection: {e}")
+
         # add to the queue if not full
         if detected_objects_queue.full():
             frame_manager.close(frame_name)

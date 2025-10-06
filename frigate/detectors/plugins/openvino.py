@@ -1,4 +1,5 @@
 import logging
+import os
 
 import numpy as np
 import openvino as ov
@@ -6,7 +7,6 @@ from pydantic import Field
 from typing_extensions import Literal
 
 from frigate.detectors.detection_api import DetectionApi
-from frigate.detectors.detection_runners import OpenVINOModelRunner
 from frigate.detectors.detector_config import BaseDetectorConfig, ModelTypeEnum
 from frigate.util.model import (
     post_process_dfine,
@@ -37,22 +37,19 @@ class OvDetector(DetectionApi):
 
     def __init__(self, detector_config: OvDetectorConfig):
         super().__init__(detector_config)
+        self.ov_core = ov.Core()
         self.ov_model_type = detector_config.model.model_type
 
         self.h = detector_config.model.height
         self.w = detector_config.model.width
 
-        self.runner = OpenVINOModelRunner(
-            model_path=detector_config.model.path,
-            device=detector_config.device,
-            model_type=detector_config.model.model_type,
-        )
+        if not os.path.isfile(detector_config.model.path):
+            logger.error(f"OpenVino model file {detector_config.model.path} not found.")
+            raise FileNotFoundError
 
-        # For dfine models, also pre-allocate target sizes tensor
-        if self.ov_model_type == ModelTypeEnum.dfine:
-            self.target_sizes_tensor = ov.Tensor(
-                np.array([[self.h, self.w]], dtype=np.int64)
-            )
+        self.interpreter = self.ov_core.compile_model(
+            model=detector_config.model.path, device_name=detector_config.device
+        )
 
         self.model_invalid = False
 
@@ -63,8 +60,8 @@ class OvDetector(DetectionApi):
             self.model_invalid = True
 
         if self.ov_model_type == ModelTypeEnum.ssd:
-            model_inputs = self.runner.compiled_model.inputs
-            model_outputs = self.runner.compiled_model.outputs
+            model_inputs = self.interpreter.inputs
+            model_outputs = self.interpreter.outputs
 
             if len(model_inputs) != 1:
                 logger.error(
@@ -83,8 +80,8 @@ class OvDetector(DetectionApi):
                 self.model_invalid = True
 
         if self.ov_model_type == ModelTypeEnum.yolonas:
-            model_inputs = self.runner.compiled_model.inputs
-            model_outputs = self.runner.compiled_model.outputs
+            model_inputs = self.interpreter.inputs
+            model_outputs = self.interpreter.outputs
 
             if len(model_inputs) != 1:
                 logger.error(
@@ -107,9 +104,7 @@ class OvDetector(DetectionApi):
             self.output_indexes = 0
             while True:
                 try:
-                    tensor_shape = self.runner.compiled_model.output(
-                        self.output_indexes
-                    ).shape
+                    tensor_shape = self.interpreter.output(self.output_indexes).shape
                     logger.info(
                         f"Model Output-{self.output_indexes} Shape: {tensor_shape}"
                     )
@@ -134,33 +129,39 @@ class OvDetector(DetectionApi):
         ]
 
     def detect_raw(self, tensor_input):
-        if self.model_invalid:
-            return np.zeros((20, 6), np.float32)
+        infer_request = self.interpreter.create_infer_request()
+        # TODO: see if we can use shared_memory=True
+        input_tensor = ov.Tensor(array=tensor_input)
 
         if self.ov_model_type == ModelTypeEnum.dfine:
-            # Use named inputs for dfine models
-            inputs = {
-                "images": tensor_input,
-                "orig_target_sizes": np.array([[self.h, self.w]], dtype=np.int64),
-            }
-            outputs = self.runner.run(inputs)
+            infer_request.set_tensor("images", input_tensor)
+            target_sizes_tensor = ov.Tensor(
+                np.array([[self.h, self.w]], dtype=np.int64)
+            )
+            infer_request.set_tensor("orig_target_sizes", target_sizes_tensor)
+            infer_request.infer()
             tensor_output = (
-                outputs[0],
-                outputs[1],
-                outputs[2],
+                infer_request.get_output_tensor(0).data,
+                infer_request.get_output_tensor(1).data,
+                infer_request.get_output_tensor(2).data,
             )
             return post_process_dfine(tensor_output, self.w, self.h)
 
-        # Run inference using the runner
-        input_name = self.runner.get_input_names()[0]
-        outputs = self.runner.run({input_name: tensor_input})
+        infer_request.infer(input_tensor)
 
         detections = np.zeros((20, 6), np.float32)
 
-        if self.ov_model_type == ModelTypeEnum.rfdetr:
-            return post_process_rfdetr(outputs)
+        if self.model_invalid:
+            return detections
+        elif self.ov_model_type == ModelTypeEnum.rfdetr:
+            return post_process_rfdetr(
+                [
+                    infer_request.get_output_tensor(0).data,
+                    infer_request.get_output_tensor(1).data,
+                ]
+            )
         elif self.ov_model_type == ModelTypeEnum.ssd:
-            results = outputs[0][0][0]
+            results = infer_request.get_output_tensor(0).data[0][0]
 
             for i, (_, class_id, score, xmin, ymin, xmax, ymax) in enumerate(results):
                 if i == 20:
@@ -175,7 +176,7 @@ class OvDetector(DetectionApi):
                 ]
             return detections
         elif self.ov_model_type == ModelTypeEnum.yolonas:
-            predictions = outputs[0]
+            predictions = infer_request.get_output_tensor(0).data
 
             for i, prediction in enumerate(predictions):
                 if i == 20:
@@ -194,10 +195,16 @@ class OvDetector(DetectionApi):
                 ]
             return detections
         elif self.ov_model_type == ModelTypeEnum.yologeneric:
-            return post_process_yolo(outputs, self.w, self.h)
+            out_tensor = []
+
+            for item in infer_request.output_tensors:
+                out_tensor.append(item.data)
+
+            return post_process_yolo(out_tensor, self.w, self.h)
         elif self.ov_model_type == ModelTypeEnum.yolox:
+            out_tensor = infer_request.get_output_tensor()
             # [x, y, h, w, box_score, class_no_1, ..., class_no_80],
-            results = outputs[0]
+            results = out_tensor.data
             results[..., :2] = (results[..., :2] + self.grids) * self.expanded_strides
             results[..., 2:4] = np.exp(results[..., 2:4]) * self.expanded_strides
             image_pred = results[0, ...]

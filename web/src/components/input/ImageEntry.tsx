@@ -8,7 +8,7 @@ import {
 } from "@/components/ui/form";
 import { cn } from "@/lib/utils";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
@@ -30,23 +30,6 @@ export default function ImageEntry({
 }: ImageEntryProps) {
   const { t } = useTranslation(["views/faceLibrary"]);
   const [preview, setPreview] = useState<string | null>(null);
-  const dropzoneRef = useRef<HTMLDivElement>(null);
-
-  // Auto focus the dropzone
-  useEffect(() => {
-    if (dropzoneRef.current && !preview) {
-      dropzoneRef.current.focus();
-    }
-  }, [preview]);
-
-  // Clean up preview URL on unmount or preview change
-  useEffect(() => {
-    return () => {
-      if (preview) {
-        URL.revokeObjectURL(preview);
-      }
-    };
-  }, [preview]);
 
   const formSchema = z.object({
     file: z
@@ -69,6 +52,9 @@ export default function ImageEntry({
         // Create preview
         const objectUrl = URL.createObjectURL(file);
         setPreview(objectUrl);
+
+        // Clean up preview URL when component unmounts
+        return () => URL.revokeObjectURL(objectUrl);
       }
     },
     [form],
@@ -81,31 +67,6 @@ export default function ImageEntry({
       accept,
       multiple: false,
     });
-
-  const handlePaste = useCallback(
-    (event: React.ClipboardEvent<HTMLDivElement>) => {
-      event.preventDefault();
-      const clipboardItems = Array.from(event.clipboardData.items);
-      for (const item of clipboardItems) {
-        if (item.type.startsWith("image/")) {
-          const blob = item.getAsFile();
-          if (blob && blob.size <= maxSize) {
-            const mimeType = blob.type.split("/")[1];
-            const extension = `.${mimeType}`;
-            if (accept["image/*"].includes(extension)) {
-              const fileName = blob.name || `pasted-image.${mimeType}`;
-              const file = new File([blob], fileName, { type: blob.type });
-              form.setValue("file", file, { shouldValidate: true });
-              const objectUrl = URL.createObjectURL(file);
-              setPreview(objectUrl);
-              return; // Take the first valid image
-            }
-          }
-        }
-      }
-    },
-    [form, maxSize, accept],
-  );
 
   const onSubmit = useCallback(
     (data: z.infer<typeof formSchema>) => {
@@ -129,12 +90,7 @@ export default function ImageEntry({
           render={() => (
             <FormItem>
               <FormControl>
-                <div
-                  className="w-full"
-                  onPaste={handlePaste}
-                  tabIndex={0}
-                  ref={dropzoneRef}
-                >
+                <div className="w-full">
                   {!preview ? (
                     <div
                       {...getRootProps()}

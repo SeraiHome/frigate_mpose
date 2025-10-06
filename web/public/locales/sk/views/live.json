@@ -54,7 +54,7 @@
     }
   },
   "camera": {
-    "enable": "Povoliť kameru",
+    "enable": "Povoliť fotoaparát",
     "disable": "Zakázať kameru"
   },
   "muteCameras": {
@@ -163,7 +163,6 @@
     "label": "Upraviť rozloženie",
     "group": {
       "label": "Upraviť skupinu kamier"
-    },
-    "exitEdit": "Ukončiť úpravy"
+    }
   }
 }

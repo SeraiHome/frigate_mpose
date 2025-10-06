@@ -34,6 +34,7 @@ from .mqtt import CameraMqttConfig
 from .notification import NotificationConfig
 from .objects import ObjectConfig
 from .onvif import OnvifConfig
+from .pose import PoseConfig
 from .record import RecordConfig
 from .review import ReviewConfig
 from .snapshots import SnapshotsConfig
@@ -122,6 +123,9 @@ class CameraConfig(FrigateBaseModel):
     )
     onvif: OnvifConfig = Field(
         default_factory=OnvifConfig, title="Camera Onvif Configuration."
+    )
+    pose: PoseConfig = Field(
+        default_factory=PoseConfig, title="Pose detection configuration."
     )
     type: CameraTypeEnum = Field(default=CameraTypeEnum.generic, title="Camera Type")
     ui: CameraUiConfig = Field(

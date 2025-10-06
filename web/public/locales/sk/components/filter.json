@@ -129,8 +129,6 @@
     "loading": "Načítavajú sa rozpoznané evidenčné čísla…",
     "placeholder": "Zadajte text pre vyhľadávanie evidenčných čísel…",
     "noLicensePlatesFound": "Neboli nájdené SPZ.",
-    "selectPlatesFromList": "Vyberte jeden alebo viacero tanierov zo zoznamu.",
-    "selectAll": "Vybrať všetko",
-    "clearAll": "Vymazať všetko"
+    "selectPlatesFromList": "Vyberte jeden alebo viacero tanierov zo zoznamu."
   }
 }

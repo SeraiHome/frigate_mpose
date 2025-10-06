@@ -75,7 +75,6 @@ export default function ReviewActionGroup({
 
   useKeyboardListener(["Shift"], (_, modifiers) => {
     setBypassDialog(modifiers.shift);
-    return false;
   });
 
   const handleDelete = useCallback(() => {

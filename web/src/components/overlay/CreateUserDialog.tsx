@@ -33,15 +33,6 @@ import {
 import { Shield, User } from "lucide-react";
 import { LuCheck, LuX } from "react-icons/lu";
 import { useTranslation } from "react-i18next";
-import { isDesktop, isMobile } from "react-device-detect";
-import { cn } from "@/lib/utils";
-import {
-  MobilePage,
-  MobilePageContent,
-  MobilePageDescription,
-  MobilePageHeader,
-  MobilePageTitle,
-} from "../mobile/MobilePage";
 
 type CreateUserOverlayProps = {
   show: boolean;
@@ -119,27 +110,15 @@ export default function CreateUserDialog({
     onCancel();
   };
 
-  const Overlay = isDesktop ? Dialog : MobilePage;
-  const Content = isDesktop ? DialogContent : MobilePageContent;
-  const Header = isDesktop ? DialogHeader : MobilePageHeader;
-  const Description = isDesktop ? DialogDescription : MobilePageDescription;
-  const Title = isDesktop ? DialogTitle : MobilePageTitle;
-
   return (
-    <Overlay open={show} onOpenChange={onCancel}>
-      <Content
-        className={cn(
-          "scrollbar-container overflow-y-auto",
-          isDesktop && "my-4 flex max-h-dvh flex-col sm:max-w-[425px]",
-          isMobile && "px-4",
-        )}
-      >
-        <Header className="mt-2" onClose={onCancel}>
-          <Title>{t("users.dialog.createUser.title")}</Title>
-          <Description className={cn(!isDesktop && "sr-only")}>
+    <Dialog open={show} onOpenChange={onCancel}>
+      <DialogContent className="sm:max-w-[425px]">
+        <DialogHeader>
+          <DialogTitle>{t("users.dialog.createUser.title")}</DialogTitle>
+          <DialogDescription>
             {t("users.dialog.createUser.desc")}
-          </Description>
-        </Header>
+          </DialogDescription>
+        </DialogHeader>
 
         <Form {...form}>
           <form
@@ -307,7 +286,7 @@ export default function CreateUserDialog({
             </DialogFooter>
           </form>
         </Form>
-      </Content>
-    </Overlay>
+      </DialogContent>
+    </Dialog>
   );
 }

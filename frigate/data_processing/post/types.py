@@ -19,4 +19,3 @@ class ReviewMetadata(BaseModel):
         default=None,
         description="Other concerns highlighted by the user that are observed.",
     )
-    time: str | None = Field(default=None, description="Time of activity.")

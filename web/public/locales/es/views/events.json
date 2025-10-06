@@ -35,7 +35,5 @@
   "selected": "{{count}} seleccionados",
   "selected_one": "{{count}} seleccionados",
   "selected_other": "{{count}} seleccionados",
-  "detected": "detectado",
-  "suspiciousActivity": "Actividad Sospechosa",
-  "threateningActivity": "Actividad Amenzadora"
+  "detected": "detectado"
 }

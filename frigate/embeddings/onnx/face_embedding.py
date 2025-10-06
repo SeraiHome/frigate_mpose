@@ -6,13 +6,12 @@ import os
 import numpy as np
 
 from frigate.const import MODEL_CACHE_DIR
-from frigate.detectors.detection_runners import get_optimized_runner
-from frigate.embeddings.types import EnrichmentModelTypeEnum
 from frigate.log import redirect_output_to_logger
 from frigate.util.downloader import ModelDownloader
 
 from ...config import FaceRecognitionConfig
 from .base_embedding import BaseEmbedding
+from .runner import ONNXModelRunner
 
 try:
     from tflite_runtime.interpreter import Interpreter
@@ -27,12 +26,11 @@ FACENET_INPUT_SIZE = 160
 
 class FaceNetEmbedding(BaseEmbedding):
     def __init__(self):
-        GITHUB_ENDPOINT = os.environ.get("GITHUB_ENDPOINT", "https://github.com")
         super().__init__(
             model_name="facedet",
             model_file="facenet.tflite",
             download_urls={
-                "facenet.tflite": f"{GITHUB_ENDPOINT}/NickM-27/facenet-onnx/releases/download/v1.0/facenet.tflite",
+                "facenet.tflite": "https://github.com/NickM-27/facenet-onnx/releases/download/v1.0/facenet.tflite",
             },
         )
         self.download_path = os.path.join(MODEL_CACHE_DIR, self.model_name)
@@ -115,12 +113,11 @@ class FaceNetEmbedding(BaseEmbedding):
 
 class ArcfaceEmbedding(BaseEmbedding):
     def __init__(self, config: FaceRecognitionConfig):
-        GITHUB_ENDPOINT = os.environ.get("GITHUB_ENDPOINT", "https://github.com")
         super().__init__(
             model_name="facedet",
             model_file="arcface.onnx",
             download_urls={
-                "arcface.onnx": f"{GITHUB_ENDPOINT}/NickM-27/facenet-onnx/releases/download/v1.0/arcface.onnx",
+                "arcface.onnx": "https://github.com/NickM-27/facenet-onnx/releases/download/v1.0/arcface.onnx",
             },
         )
         self.config = config
@@ -151,10 +148,9 @@ class ArcfaceEmbedding(BaseEmbedding):
             if self.downloader:
                 self.downloader.wait_for_download()
 
-            self.runner = get_optimized_runner(
+            self.runner = ONNXModelRunner(
                 os.path.join(self.download_path, self.model_file),
                 device=self.config.device or "GPU",
-                model_type=EnrichmentModelTypeEnum.arcface.value,
             )
 
     def _preprocess_inputs(self, raw_inputs):

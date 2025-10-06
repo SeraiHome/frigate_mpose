@@ -34,7 +34,5 @@
   },
   "selected_one": "{{count}} wybrane",
   "selected_other": "{{count}} wybrane",
-  "detected": "wykryto",
-  "suspiciousActivity": "Podejrzana aktywność",
-  "threateningActivity": "Niebezpieczne działania"
+  "detected": "wykryto"
 }

@@ -95,6 +95,7 @@ cameras:
 """
 
 DEFAULT_DETECTORS = {"cpu": {"type": "cpu"}}
+DEFAULT_POSE_DETECTORS = {}  # Empty by default, users can configure
 DEFAULT_DETECT_DIMENSIONS = {"width": 1280, "height": 720}
 
 # stream info handler
@@ -355,6 +356,15 @@ class FrigateConfig(FrigateBaseModel):
     model: ModelConfig = Field(
         default_factory=ModelConfig, title="Detection model configuration."
     )
+    
+    # Pose Detector config
+    pose_detectors: Dict[str, BaseDetectorConfig] = Field(
+        default=DEFAULT_POSE_DETECTORS,
+        title="Pose detector hardware configuration.",
+    )
+    pose_model: Optional[ModelConfig] = Field(
+        default=None, title="Pose detection model configuration."
+    )
 
     # GenAI config
     genai: GenAIConfig = Field(
@@ -505,6 +515,35 @@ class FrigateConfig(FrigateBaseModel):
             labelmap_objects = model.merged_labelmap.values()
             detector_config.model = model
             self.detectors[key] = detector_config
+
+        # Validate pose detectors if configured
+        for key, detector in self.pose_detectors.items():
+            adapter = TypeAdapter(DetectorConfig)
+            model_dict = (
+                detector
+                if isinstance(detector, dict)
+                else detector.model_dump(warnings="none")
+            )
+            detector_config: BaseDetectorConfig = adapter.validate_python(model_dict)
+
+            # users should not set model themselves
+            if detector_config.model:
+                detector_config.model = None
+
+            if self.pose_model:
+                model_config = self.pose_model.model_dump(exclude_unset=True, warnings="none")
+            else:
+                model_config = {}
+
+            if detector_config.model_path:
+                model_config["path"] = detector_config.model_path
+
+            if "path" in model_config:
+                model = ModelConfig.model_validate(model_config)
+                model.check_and_load_plus_model(self.plus_api, detector_config.type)
+                model.compute_model_hash()
+                detector_config.model = model
+                self.pose_detectors[key] = detector_config
 
         for name, camera in self.cameras.items():
             modified_global_config = global_config.copy()

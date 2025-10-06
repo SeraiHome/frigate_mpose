@@ -1,6 +1,5 @@
 import logging
 import re
-from typing import Any, Dict, List
 
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from prometheus_client.core import (
@@ -451,17 +450,51 @@ class CustomCollector(object):
         yield storage_total
         yield storage_used
 
+        # count events
+        events = []
+
+        if len(events) > 0:
+            # events[0] is newest event, last element is oldest, don't need to sort
+
+            if not self.previous_event_id:
+                # ignore all previous events on startup, prometheus might have already counted them
+                self.previous_event_id = events[0]["id"]
+                self.previous_event_start_time = int(events[0]["start_time"])
+
+            for event in events:
+                # break if event already counted
+                if event["id"] == self.previous_event_id:
+                    break
+
+                # break if event starts before previous event
+                if event["start_time"] < self.previous_event_start_time:
+                    break
+
+                # store counted events in a dict
+                try:
+                    cam = self.all_events[event["camera"]]
+                    try:
+                        cam[event["label"]] += 1
+                    except KeyError:
+                        # create label dict if not exists
+                        cam.update({event["label"]: 1})
+                except KeyError:
+                    # create camera and label dict if not exists
+                    self.all_events.update({event["camera"]: {event["label"]: 1}})
+
+            # don't recount events next time
+            self.previous_event_id = events[0]["id"]
+            self.previous_event_start_time = int(events[0]["start_time"])
+
         camera_events = CounterMetricFamily(
             "frigate_camera_events",
             "Count of camera events since exporter started",
             labels=["camera", "label"],
         )
 
-        if len(self.all_events) > 0:
-            for event_count in self.all_events:
-                camera_events.add_metric(
-                    [event_count["camera"], event_count["label"]], event_count["Count"]
-                )
+        for camera, cam_dict in self.all_events.items():
+            for label, label_value in cam_dict.items():
+                camera_events.add_metric([camera, label], label_value)
 
         yield camera_events
 
@@ -470,7 +503,7 @@ collector = CustomCollector(None)
 REGISTRY.register(collector)
 
 
-def update_metrics(stats: Dict[str, Any], event_counts: List[Dict[str, Any]]):
+def update_metrics(stats):
     """Updates the Prometheus metrics with the given stats data."""
     try:
         # Store the complete stats for later use by collect()
@@ -478,8 +511,6 @@ def update_metrics(stats: Dict[str, Any], event_counts: List[Dict[str, Any]]):
 
         # For backwards compatibility
         collector.process_stats = stats.copy()
-
-        collector.all_events = event_counts
 
         # No need to call collect() here - it will be called by get_metrics()
     except Exception as e:

@@ -1,11 +1,1 @@
-{
-  "alerts": "Alarmer",
-  "detections": "Detekteringer",
-  "motion": {
-    "label": "Bevægelse",
-    "only": "Kun bevægelse"
-  },
-  "allCameras": "Alle kameraer",
-  "timeline": "Tidslinje",
-  "camera": "Kamera"
-}
+{}

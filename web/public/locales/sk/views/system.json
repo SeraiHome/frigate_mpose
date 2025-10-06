@@ -42,8 +42,7 @@
       "inferenceSpeed": "Detekčná rýchlosť",
       "temperature": "Detekčná teplota",
       "cpuUsage": "Detektor využitia CPU",
-      "memoryUsage": "Detektor využitia pamäte",
-      "cpuUsageInformation": "CPU použitý na prípravu vstupných a výstupných údajov do/z detekčných modelov. Táto hodnota nemeria využitie inferencie, a to ani v prípade použitia GPU alebo akcelerátora."
+      "memoryUsage": "Detektor využitia pamäte"
     },
     "hardwareInfo": {
       "title": "Informácie o hardvéri",
@@ -133,12 +132,7 @@
     "label": {
       "camera": "kamera",
       "detect": "odhaliť",
-      "skipped": "preskočené",
-      "ffmpeg": "FFmpeg",
-      "capture": "zachytiť",
-      "cameraFfmpeg": "{{camName}} FFmpeg",
-      "cameraCapture": "zachytiť{{camName}}",
-      "cameraDetect": "Detekcia {{camName}}"
+      "skipped": "preskočené"
     }
   }
 }

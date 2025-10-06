@@ -22,8 +22,7 @@
     "users": "Felhasználók",
     "notifications": "Értesítések",
     "frigateplus": "Frigate+",
-    "enrichments": "Extra funkciók",
-    "triggers": "Triggerek"
+    "enrichments": "Gazdagítások"
   },
   "dialog": {
     "unsavedChanges": {
@@ -565,14 +564,6 @@
       "title": "Útvonalak",
       "desc": "A követett objektum útvonalához tartozó jelentősebb pontok megjelenítése",
       "tips": "<p><strong>Útvonalak</strong></p><br><p>A vonalak és körök jelzik a követett objektum életciklusa során érintett jelentősebb pontokat.</p>"
-    },
-    "openCameraWebUI": "Nyissa meg a {{camera}} webes felületét",
-    "audio": {
-      "title": "Hang",
-      "noAudioDetections": "Nincs hangérzékelés",
-      "score": "pontszám",
-      "currentRMS": "Aktuális effektív érték",
-      "currentdbFS": "Aktuális dbFS"
     }
   },
   "motionDetectionTuner": {
@@ -662,8 +653,7 @@
       },
       "toast": {
         "success": "A következő kamera sikeresen mentve: {{cameraName}}"
-      },
-      "nameLength": "A kamera nevének kevesebbnek kell lennie 24 karakternél."
+      }
     },
     "review_descriptions": {
       "title": "Generatív MI Áttekintési Leírások",

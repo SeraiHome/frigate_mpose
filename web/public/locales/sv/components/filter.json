@@ -9,7 +9,7 @@
     "count_one": "{{count}} Etikett",
     "count_other": "{{count}} Etiketter"
   },
-  "filter": "Filtrera",
+  "filter": "Filter",
   "zones": {
     "label": "Zoner",
     "all": {

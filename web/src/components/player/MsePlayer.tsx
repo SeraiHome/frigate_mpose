@@ -84,17 +84,6 @@ function MSEPlayer({
     return `${baseUrl.replace(/^http/, "ws")}live/mse/api/ws?src=${camera}`;
   }, [camera]);
 
-  const handleError = useCallback(
-    (error: LivePlayerError, description: string = "Unknown error") => {
-      // eslint-disable-next-line no-console
-      console.error(
-        `${camera} - MSE error '${error}': ${description} See the documentation: https://docs.frigate.video/configuration/live/#live-view-faq`,
-      );
-      onError?.(error);
-    },
-    [camera, onError],
-  );
-
   const handleLoadedMetadata = useCallback(() => {
     if (videoRef.current && setFullResolution) {
       setFullResolution({
@@ -248,9 +237,9 @@ function MSEPlayer({
               onDisconnect();
             }
             if (isIOS || isSafari) {
-              handleError("mse-decode", "Safari cannot open MediaSource.");
+              onError?.("mse-decode");
             } else {
-              handleError("startup", "Error opening MediaSource.");
+              onError?.("startup");
             }
           });
         },
@@ -278,9 +267,9 @@ function MSEPlayer({
               onDisconnect();
             }
             if (isIOS || isSafari) {
-              handleError("mse-decode", "Safari cannot open MediaSource.");
+              onError?.("mse-decode");
             } else {
-              handleError("startup", "Error opening MediaSource.");
+              onError?.("startup");
             }
           });
         },
@@ -308,7 +297,7 @@ function MSEPlayer({
           if (wsRef.current) {
             onDisconnect();
           }
-          handleError("mse-decode", "Safari reported InvalidStateError.");
+          onError?.("mse-decode");
           return;
         } else {
           throw e; // Re-throw if it's not the error we're handling
@@ -435,10 +424,7 @@ function MSEPlayer({
       (bufferThreshold > 10 || bufferTime > 10)
     ) {
       onDisconnect();
-      handleError(
-        "stalled",
-        "Buffer time (10 seconds) exceeded, browser may not be playing media correctly.",
-      );
+      onError?.("stalled");
     }
 
     const playbackRate = calculateAdaptivePlaybackRate(
@@ -484,10 +470,7 @@ function MSEPlayer({
             videoRef.current
           ) {
             onDisconnect();
-            handleError(
-              "stalled",
-              `Media playback has stalled after ${timeoutDuration / 1000} seconds due to insufficient buffering or a network interruption.`,
-            );
+            onError("stalled");
           }
         }, timeoutDuration),
       );
@@ -496,7 +479,6 @@ function MSEPlayer({
     bufferTimeout,
     isPlaying,
     onDisconnect,
-    handleError,
     onError,
     onPlaying,
     playbackEnabled,
@@ -681,7 +663,7 @@ function MSEPlayer({
           if (wsRef.current) {
             onDisconnect();
           }
-          handleError("startup", "Browser reported a network error.");
+          onError?.("startup");
         }
 
         if (
@@ -692,7 +674,7 @@ function MSEPlayer({
           if (wsRef.current) {
             onDisconnect();
           }
-          handleError("mse-decode", "Safari reported decoding errors.");
+          onError?.("mse-decode");
         }
 
         setErrorCount((prevCount) => prevCount + 1);
@@ -701,7 +683,7 @@ function MSEPlayer({
           onDisconnect();
           if (errorCount >= 3) {
             // too many mse errors, try jsmpeg
-            handleError("startup", `Max error count ${errorCount} exceeded.`);
+            onError?.("startup");
           } else {
             reconnect(5000);
           }
