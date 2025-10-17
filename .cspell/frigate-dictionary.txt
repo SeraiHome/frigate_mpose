@@ -125,6 +125,7 @@ jsonify
 Kalman
 keepalive
 keepdims
+keypoint
 labelmap
 letsencrypt
 levelname

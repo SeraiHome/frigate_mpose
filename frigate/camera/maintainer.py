@@ -34,11 +34,18 @@ class CameraMaintainer(threading.Thread):
         ptz_metrics: dict[str, PTZMetrics],
         stop_event: MpEvent,
         metrics_manager: SyncManager,
+        pose_detection_queue: Queue = None,
+        tracked_poses_queue: Queue = None,
+        pose_detection_queues: dict[str, Queue] = None,
     ):
         super().__init__(name="camera_processor")
         self.config = config
         self.detection_queue = detection_queue
         self.detected_frames_queue = detected_frames_queue
+        # Support both global queue (backward compatibility) and per-camera queues
+        self.pose_detection_queue = pose_detection_queue
+        self.pose_detection_queues = pose_detection_queues or {}
+        self.tracked_poses_queue = tracked_poses_queue
         self.stop_event = stop_event
         self.camera_metrics = camera_metrics
         self.ptz_metrics = ptz_metrics
@@ -123,15 +130,60 @@ class CameraMaintainer(threading.Thread):
                     create=True,
                     size=largest_frame,
                 )
+
+                # If pose detection is enabled for this camera, initialize pose detection shared memory
+                if config.pose.enabled and (
+                    self.pose_detection_queue is not None
+                    or name in self.pose_detection_queues
+                ):
+                    try:
+                        # Calculate the largest pose frame size, defaulting to 640*640*3 if no detectors
+                        pose_frame_sizes = [
+                            det.model.height * det.model.width * 3
+                            if det.model is not None
+                            else 640 * 640 * 3
+                            for det in self.config.pose_detectors.values()
+                        ]
+                        largest_pose_frame = (
+                            max(pose_frame_sizes) if pose_frame_sizes else 640 * 640 * 3
+                        )
+
+                        # Create shared memory for pose detection input and output
+                        UntrackedSharedMemory(
+                            name=f"pose-{name}",
+                            create=True,
+                            size=largest_pose_frame,
+                        )
+
+                        # Pose output: person_id(1) + confidence(1) + keypoints(17*3=51) + bbox(4) = 57 floats
+                        UntrackedSharedMemory(
+                            name=f"pose-out-{name}", create=True, size=20 * 57 * 4
+                        )
+
+                        logger.info(f"Created pose detection shared memory for {name}")
+                    except FileExistsError:
+                        pass
             except FileExistsError:
                 pass
+
+        # Determine which pose detection queue to use for this camera
+        # Prioritize camera-specific queue if available, fallback to global queue
+        pose_queue = None
+        if config.pose.enabled:
+            pose_queue = (
+                self.pose_detection_queues.get(name)
+                if name in self.pose_detection_queues
+                else self.pose_detection_queue
+            )
 
         camera_process = CameraTracker(
             config,
             self.config.model,
             self.config.model.merged_labelmap,
             self.detection_queue,
+            pose_queue,  # Use camera-specific queue if available, otherwise global queue
             self.detected_frames_queue,
+            self.tracked_poses_queue,
             self.camera_metrics[name],
             self.ptz_metrics[name],
             self.region_grids[name],

@@ -6,7 +6,7 @@ from collections import defaultdict
 from enum import Enum
 from multiprocessing import Queue as MpQueue
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any, Dict
+from typing import Any
 
 import numpy as np
 
@@ -39,12 +39,14 @@ class TrackedPoseProcessor(threading.Thread):
         dispatcher: Dispatcher,
         tracked_poses_queue: MpQueue,
         stop_event: MpEvent,
+        ptz_autotracker_thread=None,
     ) -> None:
         super().__init__(name="pose_processor")
         self.config = config
         self.dispatcher = dispatcher
         self.tracked_poses_queue = tracked_poses_queue
         self.stop_event: MpEvent = stop_event
+        self.ptz_autotracker_thread = ptz_autotracker_thread
         self.camera_states: dict[str, CameraState] = {}
         self.frame_manager = SharedMemoryFrameManager()
 
@@ -97,7 +99,9 @@ class TrackedPoseProcessor(threading.Thread):
             message = {
                 "before": pose.previous,
                 "after": after,
-                "type": "new" if pose.previous.get("false_positive", True) else "update",
+                "type": "new"
+                if pose.previous.get("false_positive", True)
+                else "update",
             }
             self.dispatcher.publish("pose_events", json.dumps(message), retain=False)
             pose.previous = after
@@ -124,8 +128,9 @@ class TrackedPoseProcessor(threading.Thread):
 
         camera_state = CameraState(
             name=camera,
-            config=self.config.cameras[camera],
+            config=self.config,
             frame_manager=self.frame_manager,
+            ptz_autotracker_thread=self.ptz_autotracker_thread,
         )
 
         camera_state.on("start", start)
@@ -137,41 +142,41 @@ class TrackedPoseProcessor(threading.Thread):
     def should_save_pose_snapshot(self, camera: str, pose: TrackedPose) -> bool:
         """Determine if pose snapshot should be saved."""
         camera_config = self.config.cameras[camera]
-        
+
         # Check if pose detection snapshots are enabled
-        if not getattr(camera_config.snapshots, 'enabled', False):
+        if not getattr(camera_config.snapshots, "enabled", False):
             return False
-        
+
         # Check if this pose action should trigger a snapshot
-        pose_config = getattr(camera_config, 'pose', None)
-        if pose_config and hasattr(pose_config, 'snapshot_actions'):
+        pose_config = getattr(camera_config, "pose", None)
+        if pose_config and hasattr(pose_config, "snapshot_actions"):
             if pose.action not in pose_config.snapshot_actions:
                 return False
-        
+
         # Check confidence threshold
-        if pose.confidence < getattr(pose_config, 'confidence_threshold', 0.4):
+        if pose.confidence < getattr(pose_config, "confidence_threshold", 0.4):
             return False
-        
+
         return True
 
     def should_retain_pose_recording(self, camera: str, pose: TrackedPose) -> bool:
         """Determine if pose recording should be retained."""
         camera_config = self.config.cameras[camera]
-        
+
         # Check if pose detection recording is enabled
-        if not getattr(camera_config.record, 'enabled', False):
+        if not getattr(camera_config.record, "enabled", False):
             return False
-        
+
         # Check if this pose action should trigger recording
-        pose_config = getattr(camera_config, 'pose', None)
-        if pose_config and hasattr(pose_config, 'record_actions'):
+        pose_config = getattr(camera_config, "pose", None)
+        if pose_config and hasattr(pose_config, "record_actions"):
             if pose.action not in pose_config.record_actions:
                 return False
-        
+
         # Check confidence threshold
-        if pose.confidence < getattr(pose_config, 'confidence_threshold', 0.4):
+        if pose.confidence < getattr(pose_config, "confidence_threshold", 0.4):
             return False
-        
+
         return True
 
     def run(self) -> None:
@@ -200,13 +205,17 @@ class TrackedPoseProcessor(threading.Thread):
                 for pose in tracked_poses:
                     # Update pose zones
                     self._update_pose_zones(camera, pose)
-                    
+
                     # Trigger camera state updates
                     if pose.time_since_update == 0:  # New or updated pose
                         if pose.age == 1:  # New pose
-                            camera_state.on("start", camera, pose, f"{camera}_{frame_time}")
+                            camera_state.on(
+                                "start", camera, pose, f"{camera}_{frame_time}"
+                            )
                         else:  # Updated pose
-                            camera_state.on("update", camera, pose, f"{camera}_{frame_time}")
+                            camera_state.on(
+                                "update", camera, pose, f"{camera}_{frame_time}"
+                            )
                     elif pose.time_since_update > 10:  # Lost pose
                         camera_state.on("end", camera, pose, f"{camera}_{frame_time}")
 
@@ -221,18 +230,18 @@ class TrackedPoseProcessor(threading.Thread):
     def _update_pose_zones(self, camera: str, pose: TrackedPose) -> None:
         """Update pose zone tracking."""
         camera_config = self.config.cameras[camera]
-        
+
         # Check which zones the pose is currently in
         current_zones = set()
-        
-        if hasattr(camera_config, 'zones') and pose.bbox:
+
+        if hasattr(camera_config, "zones") and pose.bbox:
             x, y, w, h = pose.bbox
-            pose_center = (x + w/2, y + h/2)
-            
+            pose_center = (x + w / 2, y + h / 2)
+
             for zone_name, zone_config in camera_config.zones.items():
                 if self._point_in_zone(pose_center, zone_config.coordinates):
                     current_zones.add(zone_name)
-        
+
         # Update pose zones
         new_zones = current_zones - pose.current_zones
         pose.entered_zones.update(new_zones)
@@ -242,6 +251,7 @@ class TrackedPoseProcessor(threading.Thread):
         """Check if a point is inside a zone."""
         try:
             import cv2
+
             # Convert zone coordinates to the right format for cv2.pointPolygonTest
             zone_array = np.array(zone_coords, dtype=np.int32)
             result = cv2.pointPolygonTest(zone_array, point, False)
@@ -252,19 +262,19 @@ class TrackedPoseProcessor(threading.Thread):
     def _update_camera_activity(self, camera: str, poses: list[TrackedPose]) -> None:
         """Update camera activity based on pose detections."""
         active_poses = [p for p in poses if not p.false_positive]
-        
+
         activity = {
             "pose_count": len(active_poses),
             "actions": {},
             "zones": defaultdict(int),
         }
-        
+
         # Count actions and zones
         for pose in active_poses:
             action = pose.action.value
             activity["actions"][action] = activity["actions"].get(action, 0) + 1
-            
+
             for zone in pose.current_zones:
                 activity["zones"][zone] += 1
-        
+
         self.camera_activity[camera] = activity

@@ -4,6 +4,15 @@ from pydantic import Field
 
 from frigate.config.base import FrigateBaseModel
 from frigate.events.pose_types import PoseActionTypeEnum
+from frigate.pose_activity_detectors.detector_config import (
+    BasePoseActivityDetectorConfig,
+)
+
+
+class ActivityDetectorConfig(BasePoseActivityDetectorConfig):
+    """Configuration for pose activity detectors."""
+
+    pass
 
 
 class PoseFilterConfig(FrigateBaseModel):
@@ -30,6 +39,11 @@ class PoseConfig(FrigateBaseModel):
     )
     keypoint_threshold: float = Field(
         default=0.3, title="Minimum confidence threshold for individual keypoints."
+    )
+    activity_detector: Optional[ActivityDetectorConfig] = Field(
+        default=None,
+        title="Activity detector configuration",
+        description="Configuration for the pose activity detector.",
     )
     actions: Set[PoseActionTypeEnum] = Field(
         default_factory=lambda: {
@@ -66,10 +80,10 @@ class PoseConfig(FrigateBaseModel):
     fps: int = Field(
         default=5, title="FPS for pose detection (should be <= camera detect fps)."
     )
-    
+
     def __init__(self, **config):
         super().__init__(**config)
-        
+
         # Ensure pose detection fps doesn't exceed reasonable limits
-        if self.fps > 10:
-            self.fps = 10
+        if self.fps > 30:
+            self.fps = 30

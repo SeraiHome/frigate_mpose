@@ -93,7 +93,7 @@ class FrigateApp:
         self.detection_queue: Queue = mp.Queue()
         self.detectors: dict[str, ObjectDetectProcess] = {}
         self.detection_shms: list[mp.shared_memory.SharedMemory] = []
-        self.pose_detection_queue: Queue = mp.Queue()
+        self.pose_detection_queues: dict[str, Queue] = {}  # One queue per camera
         self.pose_detectors: dict[str, PoseDetectProcess] = {}
         self.pose_detection_shms: list[mp.shared_memory.SharedMemory] = []
         self.log_queue: Queue = mp.Queue()
@@ -156,6 +156,18 @@ class FrigateApp:
             maxsize=(
                 sum(
                     camera.enabled_in_config == True
+                    for camera in self.config.cameras.values()
+                )
+                + 2
+            )
+            * 2
+        )
+
+        # Queue for tracked poses
+        self.tracked_poses_queue: Queue = mp.Queue(
+            maxsize=(
+                sum(
+                    camera.enabled_in_config == True and camera.pose.enabled
                     for camera in self.config.cameras.values()
                 )
                 + 2
@@ -383,48 +395,71 @@ class FrigateApp:
     def start_pose_detectors(self) -> None:
         # Only start pose detectors if at least one camera has pose detection enabled
         pose_enabled_cameras = [
-            name for name, camera_config in self.config.cameras.items()
-            if camera_config.pose.enabled
+            name
+            for name, camera_config in self.config.cameras.items()
+            if camera_config.pose.enabled and camera_config.enabled_in_config
         ]
-        
+
         if not pose_enabled_cameras:
-            logger.info("No cameras have pose detection enabled, skipping pose detectors")
+            logger.info(
+                "No cameras have pose detection enabled, skipping pose detectors"
+            )
             return
 
-        for name in pose_enabled_cameras:
+        # Create shared memory for each pose-enabled camera
+        for camera_name in pose_enabled_cameras:
+            # Create a dedicated detection queue for this camera
+            self.pose_detection_queues[camera_name] = mp.Queue()
+
             try:
                 # Calculate the largest pose frame size, defaulting to 320 if no detectors
-                pose_frame_sizes = [
-                    det.model.height * det.model.width * 3
-                    if det.model is not None
-                    else 320
-                    for det in self.config.pose_detectors.values()
-                ]
-                largest_pose_frame = max(pose_frame_sizes) if pose_frame_sizes else 320
+                # RemotePoseDetector creates a 4D array with shape (1, height, width, 3)
+                # The exact buffer size calculation is tricky due to memory alignment and overhead
+                # So we use a generous multiplier to ensure there's always enough space
+                # Calculate a guaranteed large enough buffer for pose detection
+                # We need to ensure it can handle any reasonable image size
+                # 640x480 RGB = 921,600 bytes
+                # Add extra buffer for alignment and use a minimum of 10MB
+                # Using 10MB (10,485,760 bytes) to be safe
+                largest_pose_frame = 10485760  # 10MB
+                logger.info(
+                    "Setting pose detection buffer size to 10MB for all cameras"
+                )
+                logger.info(
+                    f"Allocating pose detection buffer of size: {largest_pose_frame} bytes for camera {camera_name}"
+                )
                 shm_in = UntrackedSharedMemory(
-                    name=f"pose-{name}",
+                    name=f"pose-{camera_name}",
                     create=True,
                     size=largest_pose_frame,
                 )
             except FileExistsError:
-                shm_in = UntrackedSharedMemory(name=f"pose-{name}")
+                shm_in = UntrackedSharedMemory(name=f"pose-{camera_name}")
 
             try:
                 # Pose output: person_id(1) + confidence(1) + keypoints(17*3=51) + bbox(4) = 57 floats
                 shm_out = UntrackedSharedMemory(
-                    name=f"pose-out-{name}", create=True, size=20 * 57 * 4
+                    name=f"pose-out-{camera_name}", create=True, size=20 * 57 * 4
                 )
             except FileExistsError:
-                shm_out = UntrackedSharedMemory(name=f"pose-out-{name}")
+                shm_out = UntrackedSharedMemory(name=f"pose-out-{camera_name}")
 
             self.pose_detection_shms.append(shm_in)
             self.pose_detection_shms.append(shm_out)
 
-        for name, pose_detector_config in self.config.pose_detectors.items():
-            self.pose_detectors[name] = PoseDetectProcess(
-                name,
-                self.pose_detection_queue,
-                pose_enabled_cameras,
+        # Create one detector per camera to maintain temporal integrity
+        for camera_name in pose_enabled_cameras:
+            # Use the first detector config for now (we could make this configurable per camera)
+            detector_name = next(iter(self.config.pose_detectors))
+            pose_detector_config = self.config.pose_detectors[detector_name]
+
+            # Create a detector process dedicated to this camera
+            detector_instance_name = f"{detector_name}_{camera_name}"
+            logger.info(f"Creating pose detector process: {detector_instance_name}")
+            self.pose_detectors[detector_instance_name] = PoseDetectProcess(
+                detector_instance_name,
+                self.pose_detection_queues[camera_name],  # Use camera-specific queue
+                [camera_name],  # Only process frames from this camera
                 self.config,
                 pose_detector_config,
                 self.stop_event,
@@ -441,6 +476,7 @@ class FrigateApp:
         self.ptz_autotracker_thread.start()
 
     def start_detected_frames_processor(self) -> None:
+        # Start object detection processor
         self.detected_frames_processor = TrackedObjectProcessor(
             self.config,
             self.dispatcher,
@@ -449,6 +485,28 @@ class FrigateApp:
             self.stop_event,
         )
         self.detected_frames_processor.start()
+
+        # Start pose detection processor if enabled for any enabled camera
+        pose_enabled_cameras = [
+            name
+            for name, camera_config in self.config.cameras.items()
+            if camera_config.pose.enabled and camera_config.enabled_in_config
+        ]
+
+        if pose_enabled_cameras and hasattr(self.config, "pose_detectors"):
+            from frigate.track.pose_processing import TrackedPoseProcessor
+
+            self.tracked_pose_processor = TrackedPoseProcessor(
+                self.config,
+                self.dispatcher,
+                self.tracked_poses_queue,
+                self.stop_event,
+                ptz_autotracker_thread=self.ptz_autotracker_thread,
+            )
+            self.tracked_pose_processor.start()
+            logger.info(
+                f"Pose processing started for cameras: {', '.join(pose_enabled_cameras)}"
+            )
 
     def start_video_output_processor(self) -> None:
         output_processor = OutputProcess(self.config, self.stop_event)
@@ -465,6 +523,8 @@ class FrigateApp:
             self.ptz_metrics,
             self.stop_event,
             self.metrics_manager,
+            pose_detection_queues=self.pose_detection_queues,  # Pass dictionary of queues
+            tracked_poses_queue=self.tracked_poses_queue,
         )
         self.camera_maintainer.start()
 
@@ -664,13 +724,22 @@ class FrigateApp:
 
         empty_and_close_queue(self.detection_queue)
         logger.info("Detection queue closed")
-        
-        empty_and_close_queue(self.pose_detection_queue)
-        logger.info("Pose detection queue closed")
 
+        # Close all pose detection queues
+        for camera_name, queue in self.pose_detection_queues.items():
+            empty_and_close_queue(queue)
+            logger.info(f"Pose detection queue for {camera_name} closed")
+
+        # Join tracked object processor
         self.detected_frames_processor.join()
         empty_and_close_queue(self.detected_frames_queue)
         logger.info("Detected frames queue closed")
+
+        # Join tracked pose processor if it exists
+        if hasattr(self, "tracked_pose_processor"):
+            self.tracked_pose_processor.join()
+            empty_and_close_queue(self.tracked_poses_queue)
+            logger.info("Tracked poses queue closed")
 
         self.timeline_processor.join()
         self.event_processor.join()

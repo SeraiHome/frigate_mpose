@@ -1,14 +1,89 @@
 import logging
-from typing import Any, Dict, Optional
+from collections import deque
+from typing import Any, Dict, Optional, Set, Tuple
 
 import numpy as np
 
 from frigate.events.pose_types import PoseActionTypeEnum
+from frigate.pose_activity_detectors import create_activity_detector
+from frigate.pose_activity_detectors.base import PoseActivityDetector
+from frigate.pose_activity_detectors.detector_config import create_detector_config
 
 logger = logging.getLogger(__name__)
 
 
 class TrackedPose:
+    # Active detector instance
+    active_detector: Optional[PoseActivityDetector] = None
+
+    @classmethod
+    def init_activity_detector(
+        cls, detector_type: str, model_path: Optional[str] = None, **kwargs
+    ):
+        """
+        Initialize the activity detector with the specified type and model.
+
+        Args:
+            detector_type: Type of detector to use (must be in activity_detectors registry)
+            model_path: Path to the model file (if required by the detector)
+            **kwargs: Additional keyword arguments for the detector
+
+        Returns:
+            bool: True if initialization was successful, False otherwise
+        """
+        # Create configuration for the detector
+        config_dict = {"type": detector_type, "model_path": model_path, **kwargs}
+        detector_config = create_detector_config(config_dict)
+        
+        if detector_config is None:
+            logger.error(f"Failed to create configuration for detector type: {detector_type}")
+            return False
+
+        # Create detector instance
+        try:
+            cls.active_detector = create_activity_detector(detector_config)
+            if cls.active_detector:
+                logger.info(f"Activity detector initialized: {detector_type}")
+                return cls.active_detector.initialized
+            else:
+                logger.error(f"Failed to create activity detector: {detector_type}")
+                return False
+        except Exception as e:
+            logger.error(f"Failed to initialize activity detector: {e}")
+            cls.active_detector = None
+            return False
+
+    @classmethod
+    def init_from_config(cls, config):
+        """
+        Initialize the activity detector from configuration.
+
+        Args:
+            config: PoseConfig instance containing activity detector configuration
+
+        Returns:
+            bool: True if initialization was successful, False otherwise
+        """
+        if not config or not config.activity_detector:
+            # No activity detector configured, use default heuristic detector
+            logger.info(
+                "No activity detector configured, using default heuristic detector"
+            )
+            return cls.init_activity_detector("heuristic")
+
+        detector_config = config.activity_detector
+        detector_type = detector_config.type
+
+        # Extract parameters from config
+        kwargs = {
+            "model_path": detector_config.model_path,
+            "confidence_threshold": detector_config.confidence_threshold,
+            "num_threads": detector_config.num_threads,
+        }
+
+        logger.info(f"Initializing activity detector from config: {detector_type}")
+        return cls.init_activity_detector(detector_type, **kwargs)
+
     def __init__(
         self,
         pose_id: str,
@@ -24,16 +99,16 @@ class TrackedPose:
         self.confidence = confidence
         self.bbox = bbox or [0, 0, 0, 0]
         self.frame_time = frame_time
-        
+
         # Tracking state
         self.age = 0
         self.hit_streak = 0
         self.time_since_update = 0
-        
+
         # Pose analysis
         self.action = PoseActionTypeEnum.standing
         self.action_confidence = 0.0
-        
+
         # Event tracking
         self.has_snapshot = False
         self.has_clip = False
@@ -41,29 +116,31 @@ class TrackedPose:
         self.zone_history = []
         self.entered_zones = set()
         self.current_zones = set()
-        
+
         # History for smoothing and analysis
         self.keypoint_history = []
         self.action_history = []
-        
+
         # Store previous state for event comparison
         self.previous = self.to_dict()
 
-    def update(self, keypoints: np.ndarray, confidence: float, bbox: Optional[list] = None):
+    def update(
+        self, keypoints: np.ndarray, confidence: float, bbox: Optional[list] = None
+    ):
         """Update pose with new detection."""
         self.keypoints = keypoints
         self.confidence = confidence
         if bbox:
             self.bbox = bbox
-        
+
         self.hit_streak += 1
         self.time_since_update = 0
-        
+
         # Add to history
         self.keypoint_history.append(keypoints.copy())
         if len(self.keypoint_history) > 10:  # Keep last 10 frames
             self.keypoint_history.pop(0)
-        
+
         # Analyze pose action
         self._analyze_pose_action()
 
@@ -71,7 +148,7 @@ class TrackedPose:
         """Predict next pose state (for tracking)."""
         self.age += 1
         self.time_since_update += 1
-        
+
         if self.time_since_update > 0:
             self.hit_streak = 0
 
@@ -79,78 +156,44 @@ class TrackedPose:
         """Analyze keypoints to determine pose action."""
         if len(self.keypoints) < 17 or self.keypoints.shape[1] < 3:
             return
-        
+
         try:
-            # Extract key points for pose analysis
-            nose = self.keypoints[0]
-            left_shoulder = self.keypoints[5]
-            right_shoulder = self.keypoints[6]
-            left_hip = self.keypoints[11]
-            right_hip = self.keypoints[12]
-            left_knee = self.keypoints[13]
-            right_knee = self.keypoints[14]
-            left_ankle = self.keypoints[15]
-            right_ankle = self.keypoints[16]
-            
-            # Check if key points are visible
-            key_points_visible = (
-                nose[2] > 0.3 and
-                left_shoulder[2] > 0.3 and right_shoulder[2] > 0.3 and
-                left_hip[2] > 0.3 and right_hip[2] > 0.3
-            )
-            
-            if not key_points_visible:
-                self.action = PoseActionTypeEnum.standing
-                self.action_confidence = 0.3
-                return
-            
-            # Calculate body orientation and pose
-            shoulder_midpoint = [(left_shoulder[0] + right_shoulder[0]) / 2,
-                               (left_shoulder[1] + right_shoulder[1]) / 2]
-            hip_midpoint = [(left_hip[0] + right_hip[0]) / 2,
-                          (left_hip[1] + right_hip[1]) / 2]
-            
-            # Body height (shoulder to hip distance)
-            body_height = abs(shoulder_midpoint[1] - hip_midpoint[1])
-            
-            # Analyze pose based on body posture
-            if body_height < 50:  # Very low body height
-                self.action = PoseActionTypeEnum.lying
-                self.action_confidence = 0.8
-            elif nose[1] > hip_midpoint[1]:  # Head below hips
-                self.action = PoseActionTypeEnum.sitting
-                self.action_confidence = 0.7
-            else:
-                # Check leg positions for standing/walking/running
-                if (left_knee[2] > 0.3 and right_knee[2] > 0.3 and
-                    left_ankle[2] > 0.3 and right_ankle[2] > 0.3):
-                    
-                    # Calculate leg spread
-                    leg_spread = abs(left_ankle[0] - right_ankle[0])
-                    
-                    if leg_spread > 100:  # Wide stance
-                        self.action = PoseActionTypeEnum.walking
-                        self.action_confidence = 0.6
-                    else:
-                        self.action = PoseActionTypeEnum.standing
-                        self.action_confidence = 0.8
-                else:
-                    self.action = PoseActionTypeEnum.standing
-                    self.action_confidence = 0.5
-            
-            # Add to action history for smoothing
-            self.action_history.append(self.action)
-            if len(self.action_history) > 5:
-                self.action_history.pop(0)
-            
-            # Smooth action based on history
-            if len(self.action_history) >= 3:
-                most_common_action = max(set(self.action_history), 
-                                       key=self.action_history.count)
-                if self.action_history.count(most_common_action) >= 3:
-                    self.action = most_common_action
-                    self.action_confidence = min(self.action_confidence + 0.2, 1.0)
-        
+            # Try using the active detector if available
+            if self.active_detector and self.active_detector.initialized:
+                try:
+                    action, confidence = self.active_detector.detect(self.keypoints)
+
+                    # Only update if confidence is high enough
+                    if confidence > 0.4:
+                        self.action = action
+                        self.action_confidence = confidence
+
+                        # Add to action history for smoothing
+                        self.action_history.append(self.action)
+                        if len(self.action_history) > 5:
+                            self.action_history.pop(0)
+
+                        # Smooth action based on history
+                        if len(self.action_history) >= 3:
+                            most_common_action = max(
+                                set(self.action_history), key=self.action_history.count
+                            )
+                            if self.action_history.count(most_common_action) >= 3:
+                                self.action = most_common_action
+                                self.action_confidence = min(
+                                    self.action_confidence + 0.1, 1.0
+                                )
+
+                        return
+                except Exception as e:
+                    logger.warning(
+                        f"Error using activity detector: {e}, falling back to default standing pose"
+                    )
+
+            # If no detector is available or it failed, fall back to default values
+            self.action = PoseActionTypeEnum.standing
+            self.action_confidence = 0.3
+
         except Exception as e:
             logger.warning(f"Error analyzing pose action: {e}")
             self.action = PoseActionTypeEnum.standing
@@ -161,7 +204,9 @@ class TrackedPose:
         return {
             "id": self.pose_id,
             "person_id": self.person_id,
-            "keypoints": self.keypoints.tolist() if isinstance(self.keypoints, np.ndarray) else self.keypoints,
+            "keypoints": self.keypoints.tolist()
+            if isinstance(self.keypoints, np.ndarray)
+            else self.keypoints,
             "confidence": self.confidence,
             "bbox": self.bbox,
             "frame_time": self.frame_time,
@@ -180,8 +225,10 @@ class TrackedPose:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TrackedPose":
         """Create TrackedPose from dictionary."""
-        keypoints = np.array(data["keypoints"]) if data.get("keypoints") else np.zeros((17, 3))
-        
+        keypoints = (
+            np.array(data["keypoints"]) if data.get("keypoints") else np.zeros((17, 3))
+        )
+
         pose = cls(
             pose_id=data["id"],
             person_id=data.get("person_id", 0),
@@ -190,9 +237,11 @@ class TrackedPose:
             bbox=data.get("bbox", [0, 0, 0, 0]),
             frame_time=data.get("frame_time", 0.0),
         )
-        
+
         # Restore state
-        pose.action = PoseActionTypeEnum(data.get("action", PoseActionTypeEnum.standing))
+        pose.action = PoseActionTypeEnum(
+            data.get("action", PoseActionTypeEnum.standing)
+        )
         pose.action_confidence = data.get("action_confidence", 0.0)
         pose.age = data.get("age", 0)
         pose.hit_streak = data.get("hit_streak", 0)
@@ -202,5 +251,5 @@ class TrackedPose:
         pose.false_positive = data.get("false_positive", True)
         pose.entered_zones = set(data.get("entered_zones", []))
         pose.current_zones = set(data.get("current_zones", []))
-        
+
         return pose

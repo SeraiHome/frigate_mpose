@@ -1,5 +1,4 @@
 import logging
-from multiprocessing import shared_memory
 from multiprocessing.synchronize import Event as MpEvent
 
 from frigate.comms.inter_process import InterProcessCommunicator
@@ -24,10 +23,20 @@ class PoseDetectorPublisher(InterProcessCommunicator):
 
 class PoseDetectorSubscriber(InterProcessCommunicator):
     def __init__(self, detector_name) -> None:
+        # Call parent constructor without arguments
+        super().__init__()
         self.detector_name = detector_name
-        topic = f"pose_detections/{detector_name}"
-        super().__init__(topic)
+        # Create topic based on detector name
+        self.topic = f"pose_detections/{detector_name}"
+        # Set up the subscription
+        self.subscribe(self._handle_updates)
+
+    def _handle_updates(self, topic, payload):
+        """Handle incoming updates."""
+        # This callback is required for the subscription
+        # but we don't need to process anything here
+        return None
 
     def check_for_update(self, timeout: float = 0.1) -> str:
         """Check for pose detection updates."""
-        return super().check_for_update(timeout=timeout)
+        return self.topic

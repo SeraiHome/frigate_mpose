@@ -1,2 +1,3 @@
 scikit-build == 0.18.*
 nvidia-pyindex
+torch==2.2.0

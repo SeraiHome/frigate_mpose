@@ -7,7 +7,7 @@ import threading
 import time
 from multiprocessing import Queue, Value
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, Optional
 
 import cv2
 
@@ -29,6 +29,7 @@ from frigate.log import LogPipe
 from frigate.motion import MotionDetector
 from frigate.motion.improved_motion import ImprovedMotionDetector
 from frigate.object_detection.base import RemoteObjectDetector
+from frigate.pose_detection.integration import PoseDetectionIntegration
 from frigate.ptz.autotrack import ptz_moving_at_frame_time
 from frigate.track import ObjectTracker
 from frigate.track.norfair_tracker import NorfairTracker
@@ -517,7 +518,9 @@ class CameraTracker(FrigateProcess):
         model_config: ModelConfig,
         labelmap: dict[int, str],
         detection_queue: Queue,
+        pose_detection_queue: Optional[Queue],
         detected_objects_queue,
+        tracked_poses_queue: Optional[Queue],
         camera_metrics: CameraMetrics,
         ptz_metrics: PTZMetrics,
         region_grid: list[list[dict[str, Any]]],
@@ -533,10 +536,13 @@ class CameraTracker(FrigateProcess):
         self.model_config = model_config
         self.labelmap = labelmap
         self.detection_queue = detection_queue
+        self.pose_detection_queue = pose_detection_queue
         self.detected_objects_queue = detected_objects_queue
+        self.tracked_poses_queue = tracked_poses_queue
         self.camera_metrics = camera_metrics
         self.ptz_metrics = ptz_metrics
         self.region_grid = region_grid
+        self.pose_integration = None
 
     def run(self) -> None:
         self.pre_run_setup()
@@ -560,6 +566,29 @@ class CameraTracker(FrigateProcess):
 
         object_tracker = NorfairTracker(self.config, self.ptz_metrics)
 
+        # Initialize pose detection if enabled for this camera
+        if (
+            self.config.pose.enabled
+            and self.pose_detection_queue is not None
+            and self.tracked_poses_queue is not None
+        ):
+            # Get pose model config from main config if available
+            pose_model_config = getattr(self.config, "pose_model", None)
+            if pose_model_config is None:
+                # Use default model config if none specified
+                from frigate.pose_detectors.detector_config import PoseModelConfig
+
+                pose_model_config = PoseModelConfig()
+
+            self.pose_integration = PoseDetectionIntegration(
+                self.config.name,
+                self.config,
+                pose_model_config,
+                self.pose_detection_queue,
+                self.tracked_poses_queue,
+                self.stop_event,
+            )
+
         frame_manager = SharedMemoryFrameManager()
 
         # create communication for region grid updates
@@ -575,12 +604,17 @@ class CameraTracker(FrigateProcess):
             motion_detector,
             object_detector,
             object_tracker,
+            self.pose_integration,
             self.detected_objects_queue,
             self.camera_metrics,
             self.stop_event,
             self.ptz_metrics,
             self.region_grid,
         )
+
+        # Cleanup pose detection resources if initialized
+        if self.pose_integration:
+            self.pose_integration.cleanup()
 
         # empty the frame queue
         logger.info(f"{self.config.name}: emptying frame queue")
@@ -638,6 +672,7 @@ def process_frames(
     motion_detector: MotionDetector,
     object_detector: RemoteObjectDetector,
     object_tracker: ObjectTracker,
+    pose_integration: Optional[PoseDetectionIntegration],
     detected_objects_queue: Queue,
     camera_metrics: CameraMetrics,
     stop_event: MpEvent,
@@ -1002,6 +1037,14 @@ def process_frames(
         else:
             fps_tracker.update()
             camera_metrics.process_fps.value = fps_tracker.eps()
+
+            # Process pose detection if enabled for this camera
+            tracked_poses = []
+            if pose_integration and camera_config.pose.enabled:
+                tracked_poses = pose_integration.detect_poses(
+                    frame, frame_time, motion_boxes, regions
+                )
+                logger.info(f"Detected {len(tracked_poses)} poses")
             detected_objects_queue.put(
                 (
                     camera_config.name,

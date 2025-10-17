@@ -17,6 +17,7 @@ class PoseActionTypeEnum(str, Enum):
     standing = "standing"
     sitting = "sitting"
     lying = "lying"
+    falling = "falling"  # New action type for fall detection
     walking = "walking"
     running = "running"
     jumping = "jumping"

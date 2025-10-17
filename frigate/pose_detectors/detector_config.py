@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 import requests
 from pydantic import BaseModel, ConfigDict, Field
@@ -11,7 +11,6 @@ from pydantic.fields import PrivateAttr
 
 from frigate.const import MODEL_CACHE_DIR
 from frigate.plus import PlusApi
-from frigate.util.builtin import generate_color_palette
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +63,25 @@ class PoseModelConfig(BaseModel):
     )
     keypoint_names: list[str] = Field(
         default=[
-            "nose", "left_eye", "right_eye", "left_ear", "right_ear",
-            "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-            "left_wrist", "right_wrist", "left_hip", "right_hip",
-            "left_knee", "right_knee", "left_ankle", "right_ankle"
+            "nose",
+            "left_eye",
+            "right_eye",
+            "left_ear",
+            "right_ear",
+            "left_shoulder",
+            "right_shoulder",
+            "left_elbow",
+            "right_elbow",
+            "left_wrist",
+            "right_wrist",
+            "left_hip",
+            "right_hip",
+            "left_knee",
+            "right_knee",
+            "left_ankle",
+            "right_ankle",
         ],
-        title="Names of keypoints in order"
+        title="Names of keypoints in order",
     )
     confidence_threshold: float = Field(
         default=0.4, title="Minimum confidence threshold for pose detection"
@@ -77,6 +89,10 @@ class PoseModelConfig(BaseModel):
     keypoint_threshold: float = Field(
         default=0.3, title="Minimum confidence threshold for individual keypoints"
     )
+    # fall_model_path: Optional[str] = Field(
+    #     None, title="Custom model path for fall detection"
+    # )
+
     _model_hash: str = PrivateAttr()
 
     @property

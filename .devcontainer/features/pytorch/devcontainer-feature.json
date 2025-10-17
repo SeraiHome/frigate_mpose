@@ -1,0 +1,28 @@
+{
+  "id": "pytorch",
+  "version": "0.0.1",
+  "name": "PyTorch",
+  "description": "Installs PyTorch for deep learning applications, including support for STGCN fall detection.",
+  "documentationURL": "https://pytorch.org/",
+  "options": {
+    "version": {
+      "type": "string",
+      "proposals": [
+        "latest",
+        "2.2.0",
+        "2.1.0",
+        "2.0.0"
+      ],
+      "default": "2.2.0",
+      "description": "Version of PyTorch to install"
+    },
+    "cuda": {
+      "type": "boolean",
+      "default": false,
+      "description": "Install PyTorch with CUDA support (requires NVIDIA GPU)"
+    }
+  },
+  "installsAfter": [
+    "ghcr.io/devcontainers/features/common-utils"
+  ]
+}

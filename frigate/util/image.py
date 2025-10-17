@@ -834,7 +834,12 @@ class SharedMemoryFrameManager(FrameManager):
     def __init__(self):
         self.shm_store: dict[str, UntrackedSharedMemory] = {}
 
-    def create(self, name: str, size) -> AnyStr:
+    def create(self, name: str, size=None, shape=None, dtype=np.uint8) -> AnyStr:
+        # If shape is provided, calculate size from shape and dtype
+        if shape is not None:
+            size = np.prod(shape) * np.dtype(dtype).itemsize
+        if size is None:
+            raise ValueError("Must provide either size or shape for SHM creation")
         try:
             shm = UntrackedSharedMemory(
                 name=name,
