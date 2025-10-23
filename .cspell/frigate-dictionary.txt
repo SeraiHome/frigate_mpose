@@ -126,6 +126,7 @@ Kalman
 keepalive
 keepdims
 keypoint
+keypoints
 labelmap
 letsencrypt
 levelname

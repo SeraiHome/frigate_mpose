@@ -15,7 +15,7 @@ class PoseDetectionApi(ABC):
     supported_models: List[PoseModelTypeEnum]
 
     @abstractmethod
-    def __init__(self, detector_config: BasePoseDetectorConfig):
+    def __init__(self, detector_config: BasePoseDetectorConfig, camera_name=None):
         self.detector_config = detector_config
         self.thresh = 0.4
         # Default dimensions if model is None
@@ -24,6 +24,8 @@ class PoseDetectionApi(ABC):
         if detector_config.model is not None:
             self.height = detector_config.model.height
             self.width = detector_config.model.width
+        # Store camera name for debugging and identification
+        self.camera_name = camera_name
 
     @abstractmethod
     def detect_raw(self, tensor_input):

@@ -14,6 +14,7 @@ from frigate.pose_detectors.detector_config import (
     BasePoseDetectorConfig,
     PoseModelTypeEnum,
 )
+from frigate.util.image import yuv_region_2_rgb
 
 logger = logging.getLogger(__name__)
 
@@ -170,8 +171,8 @@ class MediaPipePoseApi(PoseDetectionApi):
     type_key = "mediapipe"
     supported_models = [PoseModelTypeEnum.mediapipe]
 
-    def __init__(self, detector_config: MediaPipePoseDetectorConfig):
-        super().__init__(detector_config)
+    def __init__(self, detector_config: MediaPipePoseDetectorConfig, camera_name=None):
+        super().__init__(detector_config, camera_name)
         self.frame_count = 0
         # Initialize MediaPipe using the deferred import function
         mp_instance = initialize_mediapipe()
@@ -205,7 +206,9 @@ class MediaPipePoseApi(PoseDetectionApi):
         # Ensure model is accessible at MediaPipe's expected location
         if model_path:
             ensure_model_accessible(model_path, model_complexity)
-
+        self.min_detection_confidence = getattr(
+            detector_config, "min_detection_confidence", 0.5
+        )
         try:
             # Initialize MediaPipe Pose
             self.pose = self.mp_pose.Pose(
@@ -232,281 +235,145 @@ class MediaPipePoseApi(PoseDetectionApi):
 
         logger.info("MediaPipe pose detector initialized")
 
-    def detect_raw(self, tensor_input):
+    def detect_raw(self, tensor_input, camera_name=None):
         """Run MediaPipe pose detection on input tensor."""
         try:
             self.frame_count += 1
-            logger.info(f"detect_raw mediapipe called for frame {self.frame_count}")
-
-            # Ensure debug directory exists
-            debug_dir = os.path.join(const.BASE_DIR, "debug")
-            os.makedirs(debug_dir, exist_ok=True)
-
-            # Save raw tensor input
-            logger.info(
-                f"Raw tensor_input shape: {tensor_input.shape}, dtype: {tensor_input.dtype}"
-            )
-            if len(tensor_input.shape) == 4:
-                # For 4D tensor, save a slice
-                try:
-                    # Normalize and convert to uint8 for saving
-                    tensor_norm = tensor_input[0].astype(np.float32)
-                    if np.max(tensor_norm) > 1.0:
-                        tensor_norm = tensor_norm / 255.0
-                    tensor_viz = (tensor_norm * 255).astype(np.uint8)
-
-                    # If it's a 3-channel image, save directly
-                    if tensor_viz.shape[2] == 3:
-                        tensor_path = (
-                            f"{debug_dir}/tensor_raw_4d_{self.frame_count}.jpg"
-                        )
-                        cv2.imwrite(tensor_path, tensor_viz)
-                        logger.info(f"Saved raw 4D tensor to {tensor_path}")
-                except Exception as e:
-                    logger.error(f"Failed to save raw 4D tensor: {e}")
 
             # Convert tensor to image format expected by MediaPipe
             if len(tensor_input.shape) == 4:
                 image = tensor_input[0]  # Remove batch dimension
-                logger.info(f"Removed batch dimension, new shape: {image.shape}")
-
-                # Save after batch removal
-                try:
-                    # Normalize for visualization
-                    img_norm = image.astype(np.float32)
-                    if np.max(img_norm) > 1.0:
-                        img_norm = img_norm / 255.0
-                    img_viz = (img_norm * 255).astype(np.uint8)
-
-                    if len(img_viz.shape) == 3 and img_viz.shape[2] == 3:
-                        img_path = f"{debug_dir}/tensor_after_batch_removal_{self.frame_count}.jpg"
-                        cv2.imwrite(img_path, img_viz)
-                        logger.info(f"Saved tensor after batch removal to {img_path}")
-                except Exception as e:
-                    logger.error(f"Failed to save tensor after batch removal: {e}")
             else:
                 image = tensor_input
-                logger.info(f"Using tensor as-is, shape: {image.shape}")
 
-            # Detect if this is a YUV frame (common in Frigate's pipeline)
-            is_yuv_format = False
+            # Process input according to its format
+            try:
+                # Already in RGB format (3D with appropriate dimensions)
+                if len(image.shape) == 3 and image.shape[2] == 3:
+                    # Input is already RGB (per config.yml input_pixel_format: rgb)
+                    image_rgb = image.astype(np.uint8)
 
-            # YUV frames typically have different dimensions or are 2D
-            if len(image.shape) == 2:
-                # This is likely a YUV frame that needs conversion
-                is_yuv_format = True
-                logger.info(f"Detected 2D YUV frame with shape {image.shape}")
+                # Handle YUV conversion - create square regions to avoid dimension mismatch
+                elif len(image.shape) == 2:
+                    # For I420 format, Y plane height is 2/3 of total height
+                    y_height = int(image.shape[0] * 2 / 3)
+                    frame_width = image.shape[1]
 
-                # Save raw YUV frame (just for visualization)
-                try:
-                    yuv_path = f"{debug_dir}/yuv_raw_2d_{self.frame_count}.jpg"
-                    cv2.imwrite(yuv_path, image)
-                    logger.info(f"Saved raw 2D YUV frame to {yuv_path}")
-                except Exception as e:
-                    logger.error(f"Failed to save raw 2D YUV frame: {e}")
+                    # Calculate dimensions for a square region
+                    # Use the smaller dimension as the size of our square
+                    square_size = min(frame_width, y_height)
 
-            elif len(image.shape) == 3 and image.shape[0] > image.shape[1] * 1.2:
-                # Another way to detect YUV: height is ~1.5x width for I420 format
-                is_yuv_format = True
-                logger.info(f"Detected 3D YUV frame with shape {image.shape}")
+                    # Center the square region
+                    x_center = frame_width // 2
+                    y_center = y_height // 2
 
-                # Try to save a representation of the 3D YUV frame
-                try:
-                    # Take first channel for visualization
-                    yuv_path = f"{debug_dir}/yuv_raw_3d_channel0_{self.frame_count}.jpg"
-                    cv2.imwrite(yuv_path, image[:, :, 0])
-                    logger.info(f"Saved raw 3D YUV frame (channel 0) to {yuv_path}")
-                except Exception as e:
-                    logger.error(f"Failed to save raw 3D YUV frame: {e}")
-
-            # Check for zeros in the tensor (common sign of shared memory issues)
-            if np.count_nonzero(image) == 0:
-                logger.error(
-                    f"TENSOR VALIDATION: Image contains all zeros! Shape: {image.shape}"
-                )
-
-                # Create a test pattern to verify image saving works
-                test_pattern = np.zeros(image.shape, dtype=np.uint8)
-                if len(test_pattern.shape) == 2:
-                    # Grayscale test pattern
-                    rows, cols = test_pattern.shape
-                    test_pattern[rows // 4 : rows // 2, cols // 4 : cols // 2] = (
-                        255  # White square
-                    )
-                    test_pattern[
-                        rows // 2 : 3 * rows // 4, cols // 2 : 3 * cols // 4
-                    ] = 128  # Gray square
-                elif len(test_pattern.shape) == 3:
-                    # Color test pattern
-                    rows, cols = test_pattern.shape[:2]
-                    if test_pattern.shape[2] == 3:
-                        # Red square
-                        test_pattern[
-                            rows // 4 : rows // 2, cols // 4 : cols // 2, 0
-                        ] = 255
-                        # Green square
-                        test_pattern[
-                            rows // 2 : 3 * rows // 4, cols // 2 : 3 * cols // 4, 1
-                        ] = 255
-                        # Blue square
-                        test_pattern[
-                            rows // 4 : rows // 2, cols // 2 : 3 * cols // 4, 2
-                        ] = 255
-
-                test_pattern_path = f"{debug_dir}/test_pattern_{self.frame_count}.jpg"
-                cv2.imwrite(test_pattern_path, test_pattern)
-                logger.info(
-                    f"TENSOR VALIDATION: Saved test pattern to {test_pattern_path}"
-                )
-
-                # Save memory buffer details to help diagnose shared memory issues
-                logger.info(
-                    f"MEMORY VALIDATION: Buffer memory address: {hex(image.__array_interface__['data'][0])}"
-                )
-                logger.info(
-                    f"MEMORY VALIDATION: Buffer strides: {image.__array_interface__.get('strides', 'None')}"
-                )
-                logger.info(
-                    f"MEMORY VALIDATION: Buffer readonly: {image.__array_interface__.get('readonly', False)}"
-                )
-
-            # Convert to RGB based on detected format
-            if is_yuv_format:
-                # Use Frigate's YUV to RGB conversion utility
-                from frigate.util.image import yuv_region_2_bgr, yuv_region_2_rgb
-
-                # Analyze YUV data for valid values
-                logger.info(
-                    f"YUV VALIDATION: Stats - min: {np.min(image)}, max: {np.max(image)}, mean: {np.mean(image)}"
-                )
-                # Check Y plane values (should be between 16-235 for valid video)
-                if len(image.shape) == 2:
-                    # For 2D YUV, analyze different sections
-                    height = image.shape[0]
-                    # Y plane is usually 2/3 of height
-                    y_plane = image[: height // 3 * 2, :]
-                    uv_plane = image[height // 3 * 2 :, :]
-                    logger.info(
-                        f"YUV VALIDATION: Y plane - min: {np.min(y_plane)}, max: {np.max(y_plane)}, mean: {np.mean(y_plane)}"
-                    )
-                    logger.info(
-                        f"YUV VALIDATION: UV plane - min: {np.min(uv_plane)}, max: {np.max(uv_plane)}, mean: {np.mean(uv_plane)}"
+                    # Create square region centered in the frame
+                    region = (
+                        max(0, x_center - square_size // 2),  # x_min
+                        max(0, y_center - square_size // 2),  # y_min
+                        min(frame_width, x_center + square_size // 2),  # x_max
+                        min(y_height, y_center + square_size // 2),  # y_max
                     )
 
-                # Create a region covering the entire frame
-                height = image.shape[0] // 3 * 2  # YUV height calculation
-                width = image.shape[1]
-                region = (0, 0, width, height)
+                    # Ensure the region dimensions are equal (square)
+                    region_width = region[2] - region[0]
+                    region_height = region[3] - region[1]
 
-                try:
-                    logger.info(
-                        f"Converting YUV frame to RGB for MediaPipe, YUV shape: {image.shape}, region: {region}"
-                    )
-
-                    # Try to save the YUV directly to BGR for visualization
-                    try:
-                        image_bgr_direct = yuv_region_2_bgr(image, region)
-                        bgr_direct_path = (
-                            f"{debug_dir}/yuv_to_bgr_direct_{self.frame_count}.jpg"
+                    if region_width != region_height:
+                        # Adjust to ensure square dimensions
+                        new_size = min(region_width, region_height)
+                        region = (
+                            region[0],
+                            region[1],
+                            region[0] + new_size,
+                            region[1] + new_size,
                         )
-                        cv2.imwrite(bgr_direct_path, image_bgr_direct)
-                        logger.info(
-                            f"Saved direct YUV->BGR conversion to {bgr_direct_path}"
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to directly convert YUV to BGR: {e}")
 
-                    # Now convert to RGB for MediaPipe processing
+                    # Log dimensions for debugging
+                    logger.debug(
+                        f"2D YUV frame detected: shape={image.shape}, Y height={y_height}, width={frame_width}, square region={region}"
+                    )
+
+                    # Convert YUV to RGB with square region
                     image_rgb = yuv_region_2_rgb(image, region)
 
-                    # Save the RGB image (converted to BGR for OpenCV) after YUV conversion
-                    rgb_after_yuv_path = (
-                        f"{debug_dir}/rgb_after_yuv_conversion_{self.frame_count}.jpg"
+                elif len(image.shape) == 3 and image.shape[0] > image.shape[1] * 1.2:
+                    # 3D YUV format (possibly NV12 or I420 in 3D array)
+                    frame_height = image.shape[0]
+                    frame_width = image.shape[1]
+
+                    # Calculate dimensions for a square region
+                    square_size = min(frame_width, frame_height)
+
+                    # Center the square region
+                    x_center = frame_width // 2
+                    y_center = frame_height // 2
+
+                    # Create square region centered in the frame
+                    region = (
+                        max(0, x_center - square_size // 2),  # x_min
+                        max(0, y_center - square_size // 2),  # y_min
+                        min(frame_width, x_center + square_size // 2),  # x_max
+                        min(frame_height, y_center + square_size // 2),  # y_max
                     )
-                    cv2.imwrite(
-                        rgb_after_yuv_path, cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+
+                    # Log dimensions for debugging
+                    logger.debug(
+                        f"3D YUV frame detected: shape={image.shape}, height={frame_height}, width={frame_width}, square region={region}"
                     )
-                    logger.info(
-                        f"Saved RGB (as BGR) after YUV conversion to {rgb_after_yuv_path}"
+
+                    # Convert YUV to RGB with square region
+                    image_rgb = yuv_region_2_rgb(image, region)
+
+                elif len(image.shape) == 3 and image.shape[2] == 3:
+                    # Input is already RGB (per config.yml input_pixel_format: rgb)
+                    image_rgb = image.astype(np.uint8)
+                else:
+                    # Unknown format, use as-is with warning
+                    logger.warning(
+                        f"Unknown image format with shape {image.shape}, using as-is"
                     )
+                    image_rgb = image.astype(np.uint8)
 
-                    logger.info(f"Converted to RGB with shape: {image_rgb.shape}")
-
-                except Exception as e:
-                    logger.error(f"Failed to convert YUV to RGB: {e}")
-                    import traceback
-
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-                    return np.zeros((20, 57), dtype=np.float32)
-            elif len(image.shape) == 3 and image.shape[2] == 3:
-                # Standard BGR format, convert to RGB
-                logger.info(f"Converting BGR to RGB, shape: {image.shape}")
-                image_rgb = cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_BGR2RGB)
-
-                # Save the RGB image (converted to BGR for OpenCV) after BGR->RGB conversion
-                rgb_after_bgr_path = (
-                    f"{debug_dir}/rgb_after_bgr_conversion_{self.frame_count}.jpg"
-                )
-                cv2.imwrite(
-                    rgb_after_bgr_path, cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-                )
-                logger.info(
-                    f"Saved RGB (as BGR) after BGR->RGB conversion to {rgb_after_bgr_path}"
-                )
-
-                logger.info(f"Converted to RGB with shape: {image_rgb.shape}")
-            else:
-                # Unknown format, just use as is
-                logger.warning(
-                    f"Unknown image format with shape {image.shape}, using as-is"
-                )
-                image_rgb = image.astype(np.uint8)
-
-                # Try to save unknown format
-                try:
-                    unknown_format_path = (
-                        f"{debug_dir}/unknown_format_{self.frame_count}.jpg"
-                    )
-                    cv2.imwrite(unknown_format_path, image_rgb)
-                    logger.info(f"Saved unknown format image to {unknown_format_path}")
-                except Exception as e:
-                    logger.error(f"Failed to save unknown format image: {e}")
-
-            # Save the final image that will be sent to MediaPipe (converted to BGR for OpenCV)
-            final_input_path = (
-                f"{debug_dir}/mediapipe_final_input_{self.frame_count}.jpg"
-            )
-            try:
-                # Convert RGB to BGR for OpenCV's imwrite
-                image_bgr_for_save = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(final_input_path, image_bgr_for_save)
-                logger.info(
-                    f"Saved final MediaPipe input (as BGR) to {final_input_path}"
-                )
+                # Process the image with MediaPipe (expects RGB input)
+                results = self.pose.process(image_rgb)
             except Exception as e:
-                logger.error(f"Failed to save final MediaPipe input: {e}")
+                logger.error(f"Failed to process image: {e}")
+                import traceback
 
-            # Process the image
-            results = self.pose.process(image_rgb)
-            logger.info(f"MediaPipe processing complete with results: {results}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                return np.zeros((20, 57), dtype=np.float32)
 
-            # Also save the results visualization if landmarks are detected
-            if results.pose_landmarks:
+            # Save visualization if landmarks are detected and debug dir exists
+            debug_dir = os.path.join(const.BASE_DIR, "debug")
+            if results.pose_landmarks and os.path.exists(debug_dir):
                 try:
                     # Create a copy of the RGB image for visualization
                     vis_image = image_rgb.copy()
+
                     # Draw the pose landmarks on the image
                     self.mp_drawing.draw_landmarks(
                         vis_image, results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS
                     )
-                    # Convert to BGR for saving
+
+                    # Convert RGB to BGR for OpenCV's imwrite
                     vis_image_bgr = cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR)
-                    # Save the visualization
-                    vis_path = f"{debug_dir}/pose_landmarks_{self.frame_count}.jpg"
+
+                    # Use the camera_name parameter first (if provided), then fall back to self.camera_name
+                    # This ensures consistency whether camera_name is passed via initialization or detect_raw
+                    current_camera = (
+                        camera_name if camera_name is not None else self.camera_name
+                    )
+
+                    # Save the visualization with camera name if available
+                    if current_camera:
+                        vis_path = f"{debug_dir}/pose_landmarks_{current_camera}_{self.frame_count}.jpg"
+                    else:
+                        vis_path = f"{debug_dir}/pose_landmarks_{self.frame_count}.jpg"
                     cv2.imwrite(vis_path, vis_image_bgr)
-                    logger.info(f"Saved pose landmarks visualization to {vis_path}")
+                    logger.debug(f"Saved pose visualization to {vis_path}")
                 except Exception as e:
-                    logger.error(f"Failed to save pose landmarks visualization: {e}")
+                    logger.debug(f"Failed to save pose landmarks visualization: {e}")
 
             # Post-process MediaPipe output
             return self._postprocess_mediapipe_pose(results, image.shape)
@@ -574,7 +441,9 @@ class MediaPipePoseApi(PoseDetectionApi):
             # Calculate bounding box from keypoints
             valid_points = []
             for i in range(17):
-                if keypoints[i * 3 + 2] > 0.3:  # confidence threshold
+                if (
+                    keypoints[i * 3 + 2] > self.min_detection_confidence
+                ):  # confidence threshold
                     valid_points.append([keypoints[i * 3], keypoints[i * 3 + 1]])
 
             bbox = [0, 0, 0, 0]
@@ -594,7 +463,6 @@ class MediaPipePoseApi(PoseDetectionApi):
             pose_output[1] = pose_confidence
             pose_output[2:53] = keypoints
             pose_output[53:57] = bbox
-            logger.info(f"Detected pose: {pose_output}")
             poses.append(pose_output)
 
         # Pad to fixed size (20 poses max)

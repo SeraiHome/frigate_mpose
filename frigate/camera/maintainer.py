@@ -99,7 +99,7 @@ class CameraMaintainer(threading.Thread):
 
         return shm_stats["shm_frame_count"]
 
-    def __start_camera_processor(
+    def __start_camera_processorOLD(
         self, name: str, config: CameraConfig, runtime: bool = False
     ) -> None:
         if not config.enabled_in_config:
@@ -182,6 +182,82 @@ class CameraMaintainer(threading.Thread):
             self.config.model.merged_labelmap,
             self.detection_queue,
             pose_queue,  # Use camera-specific queue if available, otherwise global queue
+            self.detected_frames_queue,
+            self.tracked_poses_queue,
+            self.camera_metrics[name],
+            self.ptz_metrics[name],
+            self.region_grids[name],
+            self.stop_event,
+        )
+        self.camera_processes[config.name] = camera_process
+        camera_process.start()
+        self.camera_metrics[config.name].process_pid.value = camera_process.pid
+        logger.info(f"Camera processor started for {config.name}: {camera_process.pid}")
+
+    def __start_camera_processor(
+        self, name: str, config: CameraConfig, runtime: bool = False
+    ) -> None:
+        if not config.enabled_in_config:
+            logger.info(f"Camera processor not started for disabled camera {name}")
+            return
+
+        if runtime:
+            self.camera_metrics[name] = CameraMetrics(self.metrics_manager)
+            self.ptz_metrics[name] = PTZMetrics(autotracker_enabled=False)
+            self.region_grids[name] = get_camera_regions_grid(
+                name,
+                config.detect,
+                max(self.config.model.width, self.config.model.height),
+            )
+
+            try:
+                largest_frame = max(
+                    [
+                        det.model.height * det.model.width * 3
+                        if det.model is not None
+                        else 320
+                        for det in self.config.detectors.values()
+                    ]
+                )
+                UntrackedSharedMemory(name=f"out-{name}", create=True, size=20 * 6 * 4)
+                UntrackedSharedMemory(
+                    name=name,
+                    create=True,
+                    size=largest_frame,
+                )
+            except FileExistsError:
+                pass
+
+            # If pose detection is enabled for this camera at runtime,
+            # SHM should already exist from app.py or needs to be created there
+            # Do NOT create pose SHM here to avoid conflicts
+            if config.pose.enabled and name not in self.pose_detection_queues:
+                logger.warning(
+                    f"Pose detection enabled for {name} but no queue exists. "
+                    f"Pose detection SHM and detector process should be started via app.py"
+                )
+
+        # Determine which pose detection queue to use for this camera
+        # Prioritize camera-specific queue if available, fallback to global queue
+        pose_queue = None
+        if config.pose.enabled:
+            if name in self.pose_detection_queues:
+                pose_queue = self.pose_detection_queues[name]
+                logger.info(f"Using camera-specific pose queue for {name}")
+            elif self.pose_detection_queue is not None:
+                pose_queue = self.pose_detection_queue
+                logger.info(f"Using global pose queue for {name}")
+            else:
+                logger.warning(
+                    f"Pose detection enabled for {name} but no queue available"
+                )
+
+        camera_process = CameraTracker(
+            config,
+            self.config.model,
+            self.config.model.merged_labelmap,
+            self.detection_queue,
+            pose_queue,
             self.detected_frames_queue,
             self.tracked_poses_queue,
             self.camera_metrics[name],

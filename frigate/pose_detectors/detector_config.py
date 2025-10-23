@@ -40,6 +40,7 @@ class PoseModelTypeEnum(str, Enum):
     openpose = "openpose"
     movenet = "movenet"
     posenet = "posenet"
+    mediapipe_task = "mediapipe_task"
 
 
 class PoseModelConfig(BaseModel):

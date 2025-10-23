@@ -6,9 +6,9 @@ from collections import defaultdict
 from enum import Enum
 from multiprocessing import Queue as MpQueue
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, List
 
-import numpy as np
+import cv2
 
 from frigate.camera.state import CameraState
 from frigate.comms.detections_updater import DetectionPublisher, DetectionTypeEnum
@@ -19,6 +19,7 @@ from frigate.config.camera.updater import (
     CameraConfigUpdateEnum,
     CameraConfigUpdateSubscriber,
 )
+from frigate.const import FAST_QUEUE_TIMEOUT
 from frigate.events.pose_types import PoseEventStateEnum, PoseEventTypeEnum
 from frigate.track.tracked_pose import TrackedPose
 from frigate.util.image import SharedMemoryFrameManager
@@ -76,7 +77,11 @@ class TrackedPoseProcessor(threading.Thread):
         )
 
         for camera in self.config.cameras.keys():
-            self.create_camera_state(camera)
+            if (
+                camera in self.config.cameras
+                and self.config.cameras[camera].pose.enabled
+            ):
+                self.create_camera_state(camera)
 
     def create_camera_state(self, camera: str) -> None:
         """Creates a new camera state for pose tracking."""
@@ -126,6 +131,11 @@ class TrackedPoseProcessor(threading.Thread):
                 )
             )
 
+        def camera_activity(camera: str, activity: dict[str, Any]) -> None:
+            last_activity = self.camera_activity.get(camera)
+            if not last_activity or activity != last_activity:
+                self.camera_activity[camera] = activity
+
         camera_state = CameraState(
             name=camera,
             config=self.config,
@@ -136,6 +146,7 @@ class TrackedPoseProcessor(threading.Thread):
         camera_state.on("start", start)
         camera_state.on("update", update)
         camera_state.on("end", end)
+        camera_state.on("camera_activity", camera_activity)
 
         self.camera_states[camera] = camera_state
 
@@ -183,47 +194,259 @@ class TrackedPoseProcessor(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 # Check for camera config updates
-                self.camera_config_subscriber.check_for_updates()
+                updated_topics = self.camera_config_subscriber.check_for_updates()
 
-                # Process pose detections
+                if "enabled" in updated_topics:
+                    for camera in updated_topics["enabled"]:
+                        if (
+                            camera in self.camera_states
+                            and self.camera_states[camera].prev_enabled is None
+                        ):
+                            self.camera_states[
+                                camera
+                            ].prev_enabled = self.config.cameras[camera].enabled
+                elif "add" in updated_topics:
+                    for camera in updated_topics["add"]:
+                        self.config.cameras[camera] = (
+                            self.camera_config_subscriber.camera_configs[camera]
+                        )
+                        if self.config.cameras[camera].pose.enabled:
+                            self.create_camera_state(camera)
+                elif "remove" in updated_topics:
+                    for camera in updated_topics["remove"]:
+                        if camera in self.camera_states:
+                            camera_state = self.camera_states[camera]
+                            camera_state.shutdown()
+                            self.camera_states.pop(camera)
+
+                # Manage camera disabled state
+                for camera, config in self.config.cameras.items():
+                    if (
+                        not config.enabled_in_config
+                        or not hasattr(config, "pose")
+                        or not config.pose.enabled
+                    ):
+                        continue
+
+                    if camera not in self.camera_states:
+                        continue
+
+                    current_enabled = config.enabled
+                    camera_state = self.camera_states[camera]
+
+                    if (
+                        hasattr(camera_state, "prev_enabled")
+                        and camera_state.prev_enabled
+                        and not current_enabled
+                    ):
+                        logger.debug(
+                            f"Not processing poses for disabled camera {camera}"
+                        )
+
+                    camera_state.prev_enabled = current_enabled
+
+                    if not current_enabled:
+                        continue
+
+                # Get the next data from the queue
                 try:
-                    (
-                        camera,
-                        frame_time,
-                        tracked_poses,
-                        motion_boxes,
-                        regions,
-                    ) = self.tracked_poses_queue.get(True, 1)
+                    queue_data = self.tracked_poses_queue.get(True, 1)
+
+                    # Check the format of the data we received
+                    if len(queue_data) == 6:
+                        # Data format: (camera, frame_name, frame_time, tracked_poses, motion_boxes, regions)
+                        (
+                            camera,
+                            frame_name,
+                            frame_time,
+                            tracked_poses,
+                            motion_boxes,
+                            regions,
+                        ) = queue_data
+                    else:
+                        # Older format: (camera, frame_time, tracked_poses, motion_boxes, regions)
+                        camera, frame_time, tracked_poses, motion_boxes, regions = (
+                            queue_data
+                        )
+                        frame_name = f"{camera}_{frame_time}"
+
                 except queue.Empty:
                     continue
 
-                camera_state = self.camera_states.get(camera)
-                if camera_state is None:
+                # Skip processing for disabled cameras or those without pose detection
+                if (
+                    camera not in self.config.cameras
+                    or not self.config.cameras[camera].enabled
+                    or not hasattr(self.config.cameras[camera], "pose")
+                    or not self.config.cameras[camera].pose.enabled
+                ):
+                    logger.debug(
+                        f"Camera {camera} disabled or pose detection disabled, skipping update"
+                    )
                     continue
 
-                # Process each tracked pose
-                for pose in tracked_poses:
-                    # Update pose zones
-                    self._update_pose_zones(camera, pose)
+                # Skip if we don't have a state for this camera
+                if camera not in self.camera_states:
+                    logger.debug(
+                        f"No camera state for {camera}, skipping pose processing"
+                    )
+                    continue
 
-                    # Trigger camera state updates
-                    if pose.time_since_update == 0:  # New or updated pose
-                        if pose.age == 1:  # New pose
-                            camera_state.on(
-                                "start", camera, pose, f"{camera}_{frame_time}"
-                            )
-                        else:  # Updated pose
-                            camera_state.on(
-                                "update", camera, pose, f"{camera}_{frame_time}"
-                            )
-                    elif pose.time_since_update > 10:  # Lost pose
-                        camera_state.on("end", camera, pose, f"{camera}_{frame_time}")
+                camera_state = self.camera_states[camera]
 
-                # Update camera activity
-                self._update_camera_activity(camera, tracked_poses)
+                # Process tracked poses
+                try:
+                    # Update pose zones before sending to camera state
+                    for pose in tracked_poses:
+                        if isinstance(pose, TrackedPose):
+                            self._update_pose_zones(camera, pose)
+
+                    # Convert tracked poses list to a dictionary keyed by pose ID
+                    # CameraState.update expects a dictionary with keys, not a list
+                    # AND it expects specific fields like score_history for TrackedObject creation
+                    tracked_poses_dict = {}
+                    for pose in tracked_poses:
+                        pose_dict = {}
+
+                        if isinstance(pose, TrackedPose):
+                            # If it's a TrackedPose object, convert to dict with its ID as key
+                            pose_dict = pose.to_dict()
+                            pose_id = pose.pose_id
+
+                            # Add required fields for TrackedObject
+                            pose_dict["score_history"] = [pose.confidence]
+                            pose_dict["start_time"] = frame_time
+                            pose_dict["frame_time"] = frame_time
+                            pose_dict["label"] = (
+                                "person"  # Poses are always associated with persons
+                            )
+                            pose_dict["top_score"] = pose.confidence
+                            pose_dict["score"] = pose.confidence
+                            pose_dict["position_changes"] = pose.hit_streak
+                            pose_dict["motionless_count"] = pose.time_since_update
+                            pose_dict["attributes"] = []
+
+                            # Ensure bbox is in the expected format [x1, y1, x2, y2]
+                            if pose.bbox and len(pose.bbox) == 4:
+                                x, y, w, h = pose.bbox
+                                pose_dict["box"] = [x, y, x + w, y + h]
+                                pose_dict["area"] = w * h
+                                pose_dict["ratio"] = w / h if h > 0 else 1.0
+                                pose_dict["region"] = [0, 0, 0, 0]  # Default region
+                            else:
+                                # Default values if no bbox
+                                pose_dict["box"] = [0, 0, 10, 10]
+                                pose_dict["area"] = 100
+                                pose_dict["ratio"] = 1.0
+                                pose_dict["region"] = [0, 0, 0, 0]
+
+                            tracked_poses_dict[pose_id] = pose_dict
+
+                        elif isinstance(pose, dict):
+                            # If it's already a dict, ensure it has required fields
+                            pose_dict = pose.copy()
+
+                            # Determine ID field
+                            if "id" in pose:
+                                pose_id = pose["id"]
+                            elif "pose_id" in pose:
+                                pose_id = pose["pose_id"]
+                            else:
+                                # Generate a unique ID if none exists
+                                pose_id = f"pose_{len(tracked_poses_dict)}"
+
+                            # Add required fields if they don't exist
+                            pose_dict.setdefault(
+                                "score_history", [pose.get("confidence", 0.5)]
+                            )
+                            pose_dict.setdefault("start_time", frame_time)
+                            pose_dict.setdefault("frame_time", frame_time)
+                            pose_dict.setdefault("label", "person")
+                            pose_dict.setdefault(
+                                "top_score", pose.get("confidence", 0.5)
+                            )
+                            pose_dict.setdefault("score", pose.get("confidence", 0.5))
+                            pose_dict.setdefault("position_changes", 1)
+                            pose_dict.setdefault("motionless_count", 0)
+                            pose_dict.setdefault("attributes", [])
+
+                            # Ensure bbox is in the expected format
+                            if "bbox" in pose and "box" not in pose:
+                                x, y, w, h = pose["bbox"]
+                                pose_dict["box"] = [x, y, x + w, y + h]
+                                pose_dict["area"] = w * h
+                                pose_dict["ratio"] = w / h if h > 0 else 1.0
+                            elif "box" not in pose:
+                                pose_dict["box"] = [0, 0, 10, 10]
+                                pose_dict["area"] = 100
+                                pose_dict["ratio"] = 1.0
+
+                            if "region" not in pose:
+                                pose_dict["region"] = [0, 0, 0, 0]
+
+                            tracked_poses_dict[pose_id] = pose_dict
+
+                    # Now update the camera state with the dictionary of tracked poses
+                    camera_state.update(
+                        frame_name,
+                        frame_time,
+                        tracked_poses_dict,
+                        motion_boxes,
+                        regions,
+                    )
+
+                    # Publish detection info for this frame
+                    self.detection_publisher.publish(
+                        (
+                            camera,
+                            frame_name,
+                            frame_time,
+                            [
+                                p.to_dict() if hasattr(p, "to_dict") else p
+                                for p in tracked_poses
+                            ],
+                            motion_boxes,
+                            regions,
+                        ),
+                        DetectionTypeEnum.video.value,  # Use "video" type since pose is not defined in enum
+                    )
+
+                    # Update camera activity based on the poses
+                    self._update_camera_activity(camera, tracked_poses)
+
+                    # Check for any events that need to be ended
+                    while not self.stop_event.is_set():
+                        update = self.event_end_subscriber.check_for_update(
+                            timeout=FAST_QUEUE_TIMEOUT
+                        )
+
+                        if not update:
+                            break
+
+                        event_id, event_camera, _ = update
+                        if event_camera == camera and camera in self.camera_states:
+                            self.camera_states[camera].finished(event_id)
+
+                except Exception as e:
+                    logger.error(f"Error processing poses for camera {camera}: {e}")
+                    import traceback
+
+                    logger.error(traceback.format_exc())
 
             except Exception as e:
-                logger.error(f"Error in pose processor: {e}")
+                logger.error(f"Error in pose processor main loop: {e}")
+                import traceback
+
+                logger.error(traceback.format_exc())
+
+        # Cleanup when stopping
+        for state in self.camera_states.values():
+            state.shutdown()
+
+        self.detection_publisher.stop()
+        self.event_sender.stop()
+        self.event_end_subscriber.stop()
+        self.camera_config_subscriber.stop()
 
         logger.info("Exiting pose processor...")
 
@@ -235,46 +458,73 @@ class TrackedPoseProcessor(threading.Thread):
         current_zones = set()
 
         if hasattr(camera_config, "zones") and pose.bbox:
+            # Use bottom center of bounding box for zone detection
             x, y, w, h = pose.bbox
-            pose_center = (x + w / 2, y + h / 2)
+            bottom_center = (
+                x + w / 2,
+                y + h,
+            )  # Bottom center is more reliable for zone detection
 
             for zone_name, zone_config in camera_config.zones.items():
-                if self._point_in_zone(pose_center, zone_config.coordinates):
-                    current_zones.add(zone_name)
+                # Skip zones that don't include poses/persons
+                if hasattr(zone_config, "objects") and len(zone_config.objects) > 0:
+                    if (
+                        "person" not in zone_config.objects
+                        and "pose" not in zone_config.objects
+                    ):
+                        continue
+
+                if hasattr(zone_config, "contour"):
+                    # Use the contour for zone detection
+                    if (
+                        cv2.pointPolygonTest(zone_config.contour, bottom_center, False)
+                        >= 0
+                    ):
+                        current_zones.add(zone_name)
 
         # Update pose zones
         new_zones = current_zones - pose.current_zones
         pose.entered_zones.update(new_zones)
         pose.current_zones = current_zones
 
-    def _point_in_zone(self, point, zone_coords) -> bool:
-        """Check if a point is inside a zone."""
-        try:
-            import cv2
-
-            # Convert zone coordinates to the right format for cv2.pointPolygonTest
-            zone_array = np.array(zone_coords, dtype=np.int32)
-            result = cv2.pointPolygonTest(zone_array, point, False)
-            return result >= 0
-        except Exception:
-            return False
-
-    def _update_camera_activity(self, camera: str, poses: list[TrackedPose]) -> None:
+    def _update_camera_activity(self, camera: str, poses: List[TrackedPose]) -> None:
         """Update camera activity based on pose detections."""
-        active_poses = [p for p in poses if not p.false_positive]
+        if not poses:
+            return
+
+        # Filter active (non-false-positive) poses
+        active_poses = []
+        for p in poses:
+            if hasattr(p, "false_positive"):
+                if not p.false_positive:
+                    active_poses.append(p)
+            else:
+                # If false_positive isn't defined, consider it as active
+                active_poses.append(p)
 
         activity = {
+            "enabled": self.config.cameras[camera].enabled,
             "pose_count": len(active_poses),
-            "actions": {},
+            "actions": defaultdict(int),
             "zones": defaultdict(int),
         }
 
         # Count actions and zones
         for pose in active_poses:
-            action = pose.action.value
-            activity["actions"][action] = activity["actions"].get(action, 0) + 1
+            # Get action, handling both enum and string types
+            if hasattr(pose, "action"):
+                action = pose.action
+                if hasattr(action, "value"):
+                    action = action.value
+                activity["actions"][action] += 1
 
-            for zone in pose.current_zones:
-                activity["zones"][zone] += 1
+            # Count poses by zone
+            if hasattr(pose, "current_zones"):
+                for zone in pose.current_zones:
+                    activity["zones"][zone] += 1
 
-        self.camera_activity[camera] = activity
+        # Call camera activity callback for this camera
+        camera_state = self.camera_states.get(camera)
+        if camera_state and "camera_activity" in camera_state.callbacks:
+            for callback in camera_state.callbacks["camera_activity"]:
+                callback(camera, activity)

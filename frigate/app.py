@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 import secrets
 import shutil
+import time
 from multiprocessing import Queue
 from multiprocessing.managers import DictProxy, SyncManager
 from multiprocessing.synchronize import Event as MpEvent
@@ -652,6 +653,7 @@ class FrigateApp:
         self.init_inter_process_communicator()
         self.start_detectors()
         self.start_pose_detectors()
+        time.sleep(0.1)  # Allow detectors to initialize SHM
         self.init_dispatcher()
         self.init_embeddings_client()
         self.start_video_output_processor()
