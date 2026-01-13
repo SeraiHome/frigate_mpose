@@ -174,27 +174,35 @@ class ActiveObjects:
         }
 
         for o in all_objects:
+            # be defensive: tolerate missing keys coming from various detection sources
+            motionless_count = o.get("motionless_count", 0)
+            pending_loitering = o.get("pending_loitering", False)
+            position_changes = o.get("position_changes", 0)
+            frame_time_val = o.get("frame_time")
+            false_positive = o.get("false_positive", True)
+            label = o.get("label")
+
             if (
-                o["motionless_count"] >= camera_config.detect.stationary.threshold
-                and not o["pending_loitering"]
+                motionless_count >= camera_config.detect.stationary.threshold
+                and not pending_loitering
             ):
                 # no stationary objects unless loitering
                 continue
 
-            if o["position_changes"] == 0:
+            if position_changes == 0:
                 # object must have moved at least once
                 continue
 
-            if o["frame_time"] != frame_time:
+            if frame_time_val != frame_time:
                 # object must be detected in this frame
                 continue
 
-            if o["false_positive"]:
+            if false_positive:
                 # object must not be a false positive
                 continue
 
             if (
-                o["label"] in camera_config.review.alerts.labels
+                label in camera_config.review.alerts.labels
                 and (
                     not camera_config.review.alerts.required_zones
                     or (

@@ -80,6 +80,16 @@ class PoseConfig(FrigateBaseModel):
     fps: int = Field(
         default=5, title="FPS for pose detection (should be <= camera detect fps)."
     )
+    publish_to_detected_objects: bool = Field(
+        default=True,
+        title="Publish pose detections to the main detected_objects queue.",
+        description=(
+            "When true, pose detections will be added to the standard "
+            "detected_objects_queue in addition to being sent to the pose queues. "
+            "Set to false to avoid timing interference and use the pose-specific "
+            "processing pipeline instead."
+        ),
+    )
 
     def __init__(self, **config):
         super().__init__(**config)

@@ -121,6 +121,23 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
 
             self.landmark_pb2 = landmark_pb2
 
+            # Attempt to preload an EdgeTPU delegate if configured for this detector.
+            # accel = getattr(detector_config, "accelerator", None)
+            # device = getattr(detector_config, "device", None)
+            # if accel and str(accel).lower() in ("edgetpu", "coral"):
+            #     try:
+            #         # Try to load the EdgeTPU delegate early so MediaPipe's
+            #         # TFLite runtime can pick it up when creating interpreters.
+            #         from tflite_runtime.interpreter import load_delegate
+
+            #         if device:
+            #             load_delegate("libedgetpu.so.1.0", {"device": device})
+            #         else:
+            #             load_delegate("libedgetpu.so.1.0")
+            #         logger.info("Preloaded EdgeTPU delegate via tflite_runtime")
+            #     except Exception as e:
+            #         logger.warning(f"Could not preload EdgeTPU delegate: {e}")
+
             # Create base options for the task
             base_options = python.BaseOptions(model_asset_path=model_path)
             # Create pose landmarker options
@@ -274,7 +291,7 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
 
             # Save visualization if landmarks are detected and debug dir exists
             debug_dir = os.path.join(const.BASE_DIR, "debug")
-            if results.pose_landmarks and os.path.exists(debug_dir):
+            if False:  # results.pose_landmarks and os.path.exists(debug_dir):
                 try:
                     # Create a copy of the RGB image for visualization
                     vis_image = image_rgb.copy()

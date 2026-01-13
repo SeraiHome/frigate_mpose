@@ -191,7 +191,7 @@ class PoseDetectorRunner(FrigateProcess):
                 shm_name = f"pose-{connection_id}"
 
             # Debug the actual SHM name being used
-            logger.info(
+            logger.debug(
                 f"[POSE PROC] Accessing shared memory with name: {shm_name} for frame {self.frame_count}"
             )
 
@@ -218,7 +218,7 @@ class PoseDetectorRunner(FrigateProcess):
 
                     # Verify data
                     non_zero = np.count_nonzero(result)
-                    logger.info(
+                    logger.debug(
                         f"[POSE PROC] Force sync: shm={shm_name}, shape={result.shape}, non-zero={non_zero}"
                     )
 
@@ -230,7 +230,7 @@ class PoseDetectorRunner(FrigateProcess):
                 return None
 
             # Try different access methods for shared memory to avoid synchronization issues
-            logger.info(
+            logger.debug(
                 f"[POSE PROC] Accessing shared memory for frame {self.frame_count} with multiple methods"
             )
 
@@ -238,7 +238,7 @@ class PoseDetectorRunner(FrigateProcess):
             try:
                 # frame_manager.create(shm_name, shape=input_shape, dtype=np.uint8)
                 input_frame = frame_manager.get(shm_name, input_shape)
-                logger.info(
+                logger.debug(
                     f"[POSE PROC] Method 1: Got frame from frame_manager with shape {input_frame.shape if input_frame is not None else 'None'}"
                 )
             except Exception as e:
@@ -247,12 +247,12 @@ class PoseDetectorRunner(FrigateProcess):
             # Check if frame has data
             if input_frame is not None:
                 non_zero_count = np.count_nonzero(input_frame)
-                logger.info(
+                logger.debug(
                     f"[POSE PROC] Frame manager frame has {non_zero_count} non-zero values"
                 )
                 if non_zero_count == 0:
                     # Frame exists but is empty - force synchronization
-                    logger.info(
+                    logger.debug(
                         "[POSE PROC] Frame manager returned empty frame, forcing sync"
                     )
                     input_frame = force_memory_sync(shm_name, input_shape)
@@ -295,12 +295,12 @@ class PoseDetectorRunner(FrigateProcess):
                             f"{debug_dir}/input_frame_raw_{self.name}_{self.frame_count}_{time.time():.6f}.jpg",
                             frame_to_save,
                         )
-                        logger.info("[SHM-ANALYSIS] Saved raw frame as fallback")
+                        logger.debug("[SHM-ANALYSIS] Saved raw frame as fallback")
                     except Exception as e2:
                         logger.error(f"[SHM-ANALYSIS] Failed to save raw frame: {e2}")
             else:
                 logger.error("[SHM-ANALYSIS] Input frame is empty or all zeros")
-            logger.info(
+            logger.debug(
                 f"[SHM-ANALYSIS] Frame Manager input frame {debug_dir}/{debug_filename}"
             )
 
@@ -314,7 +314,7 @@ class PoseDetectorRunner(FrigateProcess):
             # detect and send the output
             self.start_time.value = datetime.datetime.now().timestamp()
             poses = pose_detector.detect_raw(input_frame, camera_name=camera_name)
-            logger.info(f"poses {poses} process...")
+            logger.debug(f"poses {poses} process...")
             duration = datetime.datetime.now().timestamp() - self.start_time.value
             frame_manager.close(shm_name)
 

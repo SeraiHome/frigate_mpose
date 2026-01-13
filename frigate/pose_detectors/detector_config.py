@@ -172,6 +172,18 @@ class BasePoseDetectorConfig(BaseModel):
     model_path: Optional[str] = Field(
         default=None, title="Pose detector specific model path."
     )
+    # Hardware accelerator to use for this detector (e.g. "edgetpu" or "cpu").
+    accelerator: Optional[str] = Field(
+        default=None, title="Hardware accelerator to use (edgetpu, gpu, etc.)"
+    )
+    # Device identifier for accelerator use (for example EdgeTPU usb device string).
+    device: Optional[str] = Field(
+        default=None, title="Accelerator device identifier (optional)"
+    )
+    # Number of threads to use for CPU/TFLite inference when applicable.
+    num_threads: Optional[int] = Field(
+        default=None, title="Number of interpreter threads to use (optional)"
+    )
     model_config = ConfigDict(
         extra="allow", arbitrary_types_allowed=True, protected_namespaces=()
     )

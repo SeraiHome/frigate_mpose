@@ -88,6 +88,9 @@ class TrackedObjectProcessor(threading.Thread):
         self.event_sender = EventUpdatePublisher()
         self.event_end_subscriber = EventEndSubscriber()
         self.sub_label_subscriber = EventMetadataSubscriber(EventMetadataTypeEnum.all)
+        self.pose_action_subscriber = EventMetadataSubscriber(
+            EventMetadataTypeEnum.pose_action
+        )
 
         self.camera_activity: dict[str, dict[str, Any]] = {}
         self.ongoing_manual_events: dict[str, str] = {}
@@ -717,13 +720,45 @@ class TrackedObjectProcessor(threading.Thread):
                     break
 
                 topic = str(raw_topic)
-
                 if topic.endswith(EventMetadataTypeEnum.sub_label.value):
                     (event_id, sub_label, score) = payload
                     self.set_sub_label(event_id, sub_label, score)
                 if topic.endswith(EventMetadataTypeEnum.attribute.value):
                     (event_id, field_name, field_value, score) = payload
                     self.set_object_attribute(event_id, field_name, field_value, score)
+                elif topic.endswith(EventMetadataTypeEnum.pose_action.value):
+                    # payload: (camera, track_id, action, action_confidence, frame_name, frame_time, bbox(optional))
+                    try:
+                        (
+                            camera_name,
+                            track_id,
+                            action,
+                            action_confidence,
+                            frame_name,
+                            frame_time,
+                            bbox,
+                        ) = payload
+                    except Exception:
+                        # support payload without bbox
+                        (
+                            camera_name,
+                            track_id,
+                            action,
+                            action_confidence,
+                            frame_name,
+                            frame_time,
+                        ) = payload
+                        bbox = None
+
+                    self.apply_pose_action(
+                        camera_name,
+                        track_id,
+                        action,
+                        action_confidence,
+                        frame_name,
+                        frame_time,
+                        bbox,
+                    )
                 elif topic.endswith(EventMetadataTypeEnum.lpr_event_create.value):
                     self.create_lpr_event(payload)
                 elif topic.endswith(EventMetadataTypeEnum.save_lpr_snapshot.value):
@@ -785,6 +820,84 @@ class TrackedObjectProcessor(threading.Thread):
 
                 event_id, camera, _ = update
                 self.camera_states[camera].finished(event_id)
+
+    def apply_pose_action(
+        self,
+        camera: str,
+        track_id: str | int | None,
+        action: str,
+        action_confidence: float,
+        frame_name: str,
+        frame_time: float,
+        bbox: list | tuple | None = None,
+    ) -> None:
+        """Attach a pose action to an existing tracked object if possible.
+
+        Matching strategy:
+        - If track_id matches a tracked object id, attach there.
+        - Else if bbox provided, find a tracked object whose box overlaps or whose centroid lies within bbox and whose last frame_time is close.
+        - If a matching tracked object is found, set action/action_confidence and invoke update callbacks so snapshot/clip logic runs.
+        """
+        if camera not in self.camera_states:
+            logger.debug(f"Received pose action for unknown camera {camera}")
+            return
+
+        camera_state = self.camera_states[camera]
+
+        # direct match by track id
+        obj = None
+        if track_id is not None:
+            track_id_str = str(track_id)
+            obj = camera_state.tracked_objects.get(track_id_str)
+
+        # spatial/temporal match
+        if obj is None and bbox is not None:
+            # compute bbox center
+            try:
+                bx0, by0, bx1, by1 = bbox
+                center_x = (bx0 + bx1) / 2.0
+                center_y = (by0 + by1) / 2.0
+            except Exception:
+                center_x = center_y = None
+
+            best_obj = None
+            best_score = 0.0
+            for o in camera_state.tracked_objects.values():
+                # check temporal proximity
+                last_ft = o.obj_data.get("frame_time", 0)
+                if abs(last_ft - frame_time) > 1.0:
+                    continue
+
+                obox = o.obj_data.get("box")
+                if not obox or center_x is None:
+                    continue
+
+                # simple containment test
+                if obox[0] <= center_x <= obox[2] and obox[1] <= center_y <= obox[3]:
+                    # prefer more recent objects
+                    score = 1.0 - abs(last_ft - frame_time)
+                    if score > best_score:
+                        best_score = score
+                        best_obj = o
+
+            obj = best_obj
+
+        if obj is None:
+            logger.debug(
+                f"Pose action '{action}' (track {track_id}) on camera {camera} did not match any tracked object"
+            )
+            return
+
+        # attach action fields
+        obj.obj_data["action"] = action
+        obj.obj_data["action_confidence"] = action_confidence
+
+        # trigger update callbacks so snapshot/clip logic runs
+        for callback in camera_state.callbacks.get("update", []):
+            try:
+                callback(camera, obj, frame_name)
+            except Exception:
+                logger.exception("Error invoking update callback for pose action")
 
         # shut down camera states
         for state in self.camera_states.values():

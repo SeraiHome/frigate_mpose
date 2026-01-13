@@ -1,3 +1,9 @@
 scikit-build == 0.18.*
-nvidia-pyindex
 torch==2.2.0
+# nvidia-pyindex
+# NVIDIA PyIndex provides access to NVIDIA PyPI packages. It can cause
+# build-time errors in isolated build environments (pip not available).
+# If you need NVIDIA packages, uncomment and pin to a known working
+# version here (or install it separately in the Dockerfile before
+# building wheels). Example:
+# nvidia-pyindex==1.0.10

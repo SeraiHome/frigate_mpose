@@ -383,6 +383,9 @@ class TrackedObject:
             "frame_time": self.obj_data["frame_time"],
             "snapshot": self.thumbnail_data,
             "label": self.obj_data["label"],
+            # If this tracked object originated from a pose, action info may be present
+            "action": self.obj_data.get("action"),
+            "action_confidence": self.obj_data.get("action_confidence", 0.0),
             "sub_label": self.obj_data.get("sub_label"),
             "top_score": self.top_score,
             "false_positive": self.false_positive,
@@ -437,10 +440,46 @@ class TrackedObject:
             return None
 
         try:
-            best_frame = cv2.cvtColor(
-                self.frame_cache[self.thumbnail_data["frame_time"]]["frame"],
-                cv2.COLOR_YUV2BGR_I420,
+            raw_frame = self.frame_cache[self.thumbnail_data["frame_time"]]["frame"]
+        except KeyError:
+            logger.warning(
+                f"Unable to create clean png because frame {self.thumbnail_data['frame_time']} is not in the cache"
             )
+            return None
+
+        if not isinstance(raw_frame, np.ndarray):
+            logger.warning(
+                f"Unable to create clean png because frame {self.thumbnail_data['frame_time']} is not a numpy array (type={type(raw_frame)})."
+            )
+            return None
+
+        try:
+            if isinstance(raw_frame, np.ndarray) and raw_frame.dtype == object:
+                try:
+                    if raw_frame.shape == ():
+                        inner = raw_frame.item()
+                    else:
+                        inner = np.asarray(raw_frame.tolist(), dtype=np.uint8)
+
+                    if isinstance(inner, np.ndarray):
+                        raw_frame = inner.astype(np.uint8, copy=False)
+                    elif isinstance(inner, (bytes, bytearray, memoryview)):
+                        raw_frame = np.frombuffer(inner, dtype=np.uint8)
+                    else:
+                        raw_frame = np.asarray(inner, dtype=np.uint8)
+                except Exception:
+                    logger.warning(
+                        f"Unable to unwrap object-typed frame for {self.obj_data['id']}; type={type(raw_frame)}, shape={getattr(raw_frame, 'shape', None)}, dtype={getattr(raw_frame, 'dtype', None)}"
+                    )
+                    return None
+
+            best_frame = cv2.cvtColor(raw_frame, cv2.COLOR_YUV2BGR_I420)
+        except Exception as e:
+            logger.warning(
+                f"Unable to convert frame for {self.obj_data['id']} to BGR: {e}. "
+                f"Frame info: type={type(raw_frame)}, shape={getattr(raw_frame, 'shape', None)}, dtype={getattr(raw_frame, 'dtype', None)}"
+            )
+            return None
         except KeyError:
             logger.warning(
                 f"Unable to create clean png because frame {self.thumbnail_data['frame_time']} is not in the cache"
@@ -466,10 +505,28 @@ class TrackedObject:
             return None
 
         try:
-            best_frame = cv2.cvtColor(
-                self.frame_cache[self.thumbnail_data["frame_time"]]["frame"],
-                cv2.COLOR_YUV2BGR_I420,
+            raw_frame = self.frame_cache[self.thumbnail_data["frame_time"]]["frame"]
+        except KeyError:
+            logger.warning(
+                f"Unable to create jpg because frame {self.thumbnail_data['frame_time']} is not in the cache"
             )
+            return None
+
+        # Ensure frame is a numpy array in expected dtype
+        if not isinstance(raw_frame, np.ndarray):
+            logger.warning(
+                f"Thumbnail frame for {self.obj_data['id']} is not a numpy array (type={type(raw_frame)})."
+            )
+            return None
+
+        try:
+            best_frame = cv2.cvtColor(raw_frame, cv2.COLOR_YUV2BGR_I420)
+        except Exception as e:
+            logger.warning(
+                f"Unable to convert frame for {self.obj_data['id']} to BGR: {e}. "
+                f"Frame info: type={type(raw_frame)}, shape={getattr(raw_frame, 'shape', None)}, dtype={getattr(raw_frame, 'dtype', None)}"
+            )
+            return None
         except KeyError:
             logger.warning(
                 f"Unable to create jpg because frame {self.thumbnail_data['frame_time']} is not in the cache"

@@ -1,88 +1,22 @@
 import logging
 from collections import deque
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 
 from frigate.events.pose_types import PoseActionTypeEnum
-from frigate.pose_activity_detectors import create_activity_detector
 from frigate.pose_activity_detectors.base import PoseActivityDetector
-from frigate.pose_activity_detectors.detector_config import create_detector_config
 
 logger = logging.getLogger(__name__)
 
 
 class TrackedPose:
-    # Active detector instance
-    active_detector: Optional[PoseActivityDetector] = None
+    """
+    Tracked pose object for storing and analyzing detected poses.
 
-    @classmethod
-    def init_activity_detector(
-        cls, detector_type: str, model_path: Optional[str] = None, **kwargs
-    ):
-        """
-        Initialize the activity detector with the specified type and model.
-
-        Args:
-            detector_type: Type of detector to use (must be in activity_detectors registry)
-            model_path: Path to the model file (if required by the detector)
-            **kwargs: Additional keyword arguments for the detector
-
-        Returns:
-            bool: True if initialization was successful, False otherwise
-        """
-        # Create configuration for the detector
-        config_dict = {"type": detector_type, "model_path": model_path, **kwargs}
-        detector_config = create_detector_config(config_dict)
-        
-        if detector_config is None:
-            logger.error(f"Failed to create configuration for detector type: {detector_type}")
-            return False
-
-        # Create detector instance
-        try:
-            cls.active_detector = create_activity_detector(detector_config)
-            if cls.active_detector:
-                logger.info(f"Activity detector initialized: {detector_type}")
-                return cls.active_detector.initialized
-            else:
-                logger.error(f"Failed to create activity detector: {detector_type}")
-                return False
-        except Exception as e:
-            logger.error(f"Failed to initialize activity detector: {e}")
-            cls.active_detector = None
-            return False
-
-    @classmethod
-    def init_from_config(cls, config):
-        """
-        Initialize the activity detector from configuration.
-
-        Args:
-            config: PoseConfig instance containing activity detector configuration
-
-        Returns:
-            bool: True if initialization was successful, False otherwise
-        """
-        if not config or not config.activity_detector:
-            # No activity detector configured, use default heuristic detector
-            logger.info(
-                "No activity detector configured, using default heuristic detector"
-            )
-            return cls.init_activity_detector("heuristic")
-
-        detector_config = config.activity_detector
-        detector_type = detector_config.type
-
-        # Extract parameters from config
-        kwargs = {
-            "model_path": detector_config.model_path,
-            "confidence_threshold": detector_config.confidence_threshold,
-            "num_threads": detector_config.num_threads,
-        }
-
-        logger.info(f"Initializing activity detector from config: {detector_type}")
-        return cls.init_activity_detector(detector_type, **kwargs)
+    Each pose is associated with a camera and can be analyzed using
+    camera-specific activity detectors.
+    """
 
     def __init__(
         self,
@@ -92,6 +26,9 @@ class TrackedPose:
         confidence: float,
         bbox: Optional[list] = None,
         frame_time: float = 0.0,
+        camera_name: str = "",
+        frame_width: Optional[int] = None,
+        frame_height: Optional[int] = None,
     ):
         self.pose_id = pose_id
         self.person_id = person_id
@@ -99,7 +36,12 @@ class TrackedPose:
         self.confidence = confidence
         self.bbox = bbox or [0, 0, 0, 0]
         self.frame_time = frame_time
+        self.camera_name = camera_name
+        self.frame_width = frame_width
+        self.frame_height = frame_height
 
+        # Activity detector specific to this pose's camera
+        self._active_detector: Optional[PoseActivityDetector] = None
         # Tracking state
         self.age = 0
         self.hit_streak = 0
@@ -118,9 +60,18 @@ class TrackedPose:
         self.current_zones = set()
 
         # History for smoothing and analysis
-        self.keypoint_history = []
-        self.action_history = []
+        self.keypoint_history = deque(maxlen=10)
+        self.action_history = deque(maxlen=5)
 
+    @property
+    def active_detector(self) -> Optional[PoseActivityDetector]:
+        """Get the activity detector for this pose."""
+        return self._active_detector
+
+    @active_detector.setter
+    def active_detector(self, detector: Optional[PoseActivityDetector]):
+        """Set the activity detector for this pose."""
+        self._active_detector = detector
         # Store previous state for event comparison
         self.previous = self.to_dict()
 
@@ -137,9 +88,9 @@ class TrackedPose:
         self.time_since_update = 0
 
         # Add to history
-        self.keypoint_history.append(keypoints.copy())
-        if len(self.keypoint_history) > 10:  # Keep last 10 frames
-            self.keypoint_history.pop(0)
+        self.keypoint_history.append(
+            keypoints.copy()
+        )  # Will automatically maintain max length
 
         # Analyze pose action
         self._analyze_pose_action()
@@ -154,14 +105,59 @@ class TrackedPose:
 
     def _analyze_pose_action(self):
         """Analyze keypoints to determine pose action."""
+        # Validate keypoints data
         if len(self.keypoints) < 17 or self.keypoints.shape[1] < 3:
+            logger.debug(f"Insufficient keypoints data: shape={self.keypoints.shape}")
+            return
+
+        # Check for valid keypoint values
+        non_zero_coords = np.count_nonzero(self.keypoints[:, :2])
+        if non_zero_coords == 0:
+            logger.debug("All keypoint coordinates are zero - possible detection issue")
             return
 
         try:
+            # Log keypoints data for debugging
+            logger.debug(
+                f"Processing keypoints for pose {self.pose_id}: "
+                f"shape={self.keypoints.shape}, "
+                f"non-zero coords={non_zero_coords}, "
+                f"max_x={np.max(self.keypoints[:, 0]):.1f}, "
+                f"max_y={np.max(self.keypoints[:, 1]):.1f}, "
+                f"avg_conf={np.mean(self.keypoints[:, 2]):.2f}"
+            )
+
+            # Log frame dimensions if available
+            if self.frame_width and self.frame_height:
+                logger.debug(
+                    f"Frame dimensions for pose {self.pose_id}: "
+                    f"{self.frame_width}x{self.frame_height}"
+                )
+
             # Try using the active detector if available
             if self.active_detector and self.active_detector.initialized:
                 try:
-                    action, confidence = self.active_detector.detect(self.keypoints)
+                    # Log the detector we're using
+                    logger.debug(
+                        f"Using {self.active_detector.__class__.__name__} for pose {self.pose_id}"
+                    )
+
+                    # Verify keypoints before passing to detector
+                    if np.isnan(self.keypoints).any():
+                        logger.warning(
+                            "NaN values found in keypoints - replacing with zeros"
+                        )
+                        self.keypoints = np.nan_to_num(self.keypoints)
+
+                    # Pass frame dimensions if available
+                    action, confidence = self.active_detector.detect(
+                        self.keypoints,
+                        frame_width=self.frame_width,
+                        frame_height=self.frame_height,
+                    )
+                    logger.debug(
+                        f"Detector result: action={action}, confidence={confidence:.2f}"
+                    )
 
                     # Only update if confidence is high enough
                     if confidence > 0.4:
@@ -178,10 +174,13 @@ class TrackedPose:
                             most_common_action = max(
                                 set(self.action_history), key=self.action_history.count
                             )
-                            if self.action_history.count(most_common_action) >= 3:
+                            if self.action_history.count(most_common_action) >= 1:
                                 self.action = most_common_action
                                 self.action_confidence = min(
                                     self.action_confidence + 0.1, 1.0
+                                )
+                                logger.debug(
+                                    f"Smoothed action: {self.action}, confidence: {self.action_confidence:.2f}"
                                 )
 
                         return
@@ -193,6 +192,7 @@ class TrackedPose:
             # If no detector is available or it failed, fall back to default values
             self.action = PoseActionTypeEnum.standing
             self.action_confidence = 0.3
+            logger.debug("Using default standing pose")
 
         except Exception as e:
             logger.warning(f"Error analyzing pose action: {e}")
@@ -201,7 +201,7 @@ class TrackedPose:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert pose to dictionary for event processing."""
-        return {
+        result = {
             "id": self.pose_id,
             "person_id": self.person_id,
             "keypoints": self.keypoints.tolist()
@@ -210,7 +210,10 @@ class TrackedPose:
             "confidence": self.confidence,
             "bbox": self.bbox,
             "frame_time": self.frame_time,
-            "action": self.action,
+            # Ensure action is serialized as a plain string (e.g., 'standing')
+            "action": self.action.value
+            if hasattr(self.action, "value")
+            else str(self.action),
             "action_confidence": self.action_confidence,
             "age": self.age,
             "hit_streak": self.hit_streak,
@@ -221,6 +224,14 @@ class TrackedPose:
             "entered_zones": list(self.entered_zones),
             "current_zones": list(self.current_zones),
         }
+
+        # Add frame dimensions if available
+        if self.frame_width is not None:
+            result["frame_width"] = self.frame_width
+        if self.frame_height is not None:
+            result["frame_height"] = self.frame_height
+
+        return result
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TrackedPose":
@@ -236,6 +247,8 @@ class TrackedPose:
             confidence=data.get("confidence", 0.0),
             bbox=data.get("bbox", [0, 0, 0, 0]),
             frame_time=data.get("frame_time", 0.0),
+            frame_width=data.get("frame_width"),
+            frame_height=data.get("frame_height"),
         )
 
         # Restore state

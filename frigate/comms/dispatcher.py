@@ -305,8 +305,20 @@ class Dispatcher:
 
     def publish(self, topic: str, payload: Any, retain: bool = False) -> None:
         """Handle publishing to communicators."""
+        # Ensure payload is a primitive type (str/bytes/int/float/None) for
+        # communicators like MQTT which require primitive payloads. If a
+        # non-primitive (dict/list/tuple) is provided, JSON-encode it here.
+        send_payload = payload
+        if not isinstance(payload, (str, bytes, bytearray, int, float, type(None))):
+            try:
+                send_payload = json.dumps(payload)
+            except Exception:
+                logger.exception("Failed to JSON-encode payload for topic %s", topic)
+                # Fallback to string representation
+                send_payload = str(payload)
+
         for comm in self.comms:
-            comm.publish(topic, payload, retain)
+            comm.publish(topic, send_payload, retain)
 
     def stop(self) -> None:
         for comm in self.comms:

@@ -1044,7 +1044,100 @@ def process_frames(
                 tracked_poses = pose_integration.detect_poses(
                     frame, frame_time, motion_boxes, regions
                 )
-                logger.info(f"Detected {len(tracked_poses)} poses")
+                for pose in tracked_poses:
+                    logger.info(f"Detected pose: {pose.pose_id} at {frame_time}")
+                    pose_id = f"pose_{pose.pose_id}"
+
+                    # Convert bbox from [x, y, w, h] format to [x1, y1, x2, y2]
+                    if not pose.bbox or len(pose.bbox) != 4:
+                        logger.debug(
+                            f"Invalid bbox for pose {pose.pose_id}: {pose.bbox}"
+                        )
+                        continue
+
+                    try:
+                        x, y, w, h = [int(v) for v in pose.bbox]
+                        box = [x, y, x + w, y + h]  # Convert to [x1, y1, x2, y2]
+                    except Exception as e:
+                        logger.debug(
+                            f"Error converting bbox for pose {pose.pose_id}: {e}"
+                        )
+                        continue
+
+                    width = max(1, box[2] - box[0])
+                    height = max(1, box[3] - box[1])
+                    area = width * height
+
+                    # Build a detection dict compatible with TrackedObject / CameraState
+                    # Use a canonical main label (person) so object filters and
+                    # thresholds work. Store the pose action as a sub_label so
+                    # Frigate treats it like a verified/sub-label for the object.
+                    main_label = "person"
+                    # Normalize action to a plain string (enum -> value)
+                    if hasattr(pose, "action"):
+                        a = pose.action
+                        action_label = a.value if hasattr(a, "value") else str(a)
+                    else:
+                        action_label = None
+
+                    det = {
+                        "id": pose_id,
+                        "label": main_label,
+                        "sub_label": (
+                            action_label,
+                            float(
+                                getattr(
+                                    pose,
+                                    "action_confidence",
+                                    getattr(pose, "confidence", 0.0),
+                                )
+                                or 0.0
+                            ),
+                        )
+                        if action_label
+                        else None,
+                        "score": float(getattr(pose, "confidence", 0.0) or 0.0),
+                        "box": box,
+                        "area": area,
+                        "ratio": float(width) / float(height),
+                        "region": (
+                            0,
+                            0,
+                            int(frame_shape[0] * 3 // 2),
+                            int(frame_shape[1]),
+                        ),
+                        # fields expected by TrackedObject / CameraState
+                        "frame_time": frame_time,
+                        "centroid": ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2),
+                        "estimate": tuple(box),
+                        "estimate_velocity": (0, 0),
+                        "start_time": frame_time,
+                        "motionless_count": 0,
+                        "position_changes": 0,
+                        "attributes": [],
+                        # score_history is required by TrackedObject.__init__
+                        "score_history": [
+                            float(getattr(pose, "confidence", 0.0) or 0.0)
+                        ],
+                    }
+
+                    # Publish pose into the main detected_objects queue only
+                    # if configured to do so. Poses are still sent to the
+                    # `tracked_poses_queue` and processed by the dedicated
+                    # pose pipeline regardless of this flag.
+                    try:
+                        publish_pose = bool(
+                            getattr(camera_config, "pose", None)
+                            and getattr(
+                                camera_config.pose, "publish_to_detected_objects", True
+                            )
+                        )
+                    except Exception:
+                        publish_pose = True
+
+                    if publish_pose:
+                        detections[pose_id] = det
+
             detected_objects_queue.put(
                 (
                     camera_config.name,

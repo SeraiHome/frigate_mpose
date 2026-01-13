@@ -270,7 +270,13 @@ class CameraState:
         return frame_copy
 
     def finished(self, obj_id):
-        del self.tracked_objects[obj_id]
+        # Safely remove a finished tracked object if it exists. It's possible
+        # for event finalization to arrive after the object was already
+        # removed (race conditions), so avoid raising KeyError.
+        if obj_id in self.tracked_objects:
+            del self.tracked_objects[obj_id]
+        else:
+            logger.debug(f"finished() called for unknown object id: {obj_id}")
 
     def on(self, event_type: str, callback: Callable):
         self.callbacks[event_type].append(callback)

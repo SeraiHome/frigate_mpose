@@ -31,7 +31,7 @@ class HeuristicPoseDetector(PoseActivityDetector):
         body_height_threshold: int = 50,
         leg_spread_threshold: int = 100,
         confidence_threshold: float = 0.5,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize the heuristic pose detector.
@@ -45,7 +45,10 @@ class HeuristicPoseDetector(PoseActivityDetector):
         super().__init__(**kwargs)
         self.body_height_threshold = body_height_threshold
         self.leg_spread_threshold = leg_spread_threshold
-        self.confidence_threshold = confidence_threshold
+        # Allow overriding via detector config kwargs (e.g. from config.yml)
+        self.confidence_threshold = float(
+            kwargs.get("confidence_threshold", confidence_threshold)
+        )
         self.action_history = deque(maxlen=5)
         self.initialized = True
 

@@ -4,7 +4,6 @@ import multiprocessing as mp
 import os
 import secrets
 import shutil
-import time
 from multiprocessing import Queue
 from multiprocessing.managers import DictProxy, SyncManager
 from multiprocessing.synchronize import Event as MpEvent
@@ -505,6 +504,21 @@ class FrigateApp:
                 ptz_autotracker_thread=self.ptz_autotracker_thread,
             )
             self.tracked_pose_processor.start()
+
+            # Start PoseConsumer which bridges tracked poses into the object
+            # pipeline when pose actions occur. It will synthesize detected-object
+            # messages into the existing `detected_frames_queue` so the normal
+            # object processing (events, clips, review) runs unchanged.
+            from frigate.track.pose_consumer import PoseConsumer
+
+            self.pose_consumer = PoseConsumer(
+                self.config,
+                self.dispatcher,
+                self.stop_event,
+                ptz_autotracker_thread=self.ptz_autotracker_thread,
+                detected_frames_queue=self.detected_frames_queue,
+            )
+            self.pose_consumer.start()
             logger.info(
                 f"Pose processing started for cameras: {', '.join(pose_enabled_cameras)}"
             )
@@ -653,7 +667,7 @@ class FrigateApp:
         self.init_inter_process_communicator()
         self.start_detectors()
         self.start_pose_detectors()
-        time.sleep(0.1)  # Allow detectors to initialize SHM
+        # time.sleep(0.1)  # Allow detectors to initialize SHM
         self.init_dispatcher()
         self.init_embeddings_client()
         self.start_video_output_processor()

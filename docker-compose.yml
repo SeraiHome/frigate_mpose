@@ -3,12 +3,13 @@ services:
     container_name: frigate-devcontainer
     # Check host system's actual render/video/plugdev group IDs with 'getent group render', 'getent group video', and 'getent group plugdev'
     # Must add these exact IDs in container's group_add section or OpenVINO GPU acceleration will fail
+   # privileged: true
     group_add:
       - "109" # render
       - "110" # render
       - "44"  # video
       - "46"  # plugdev
-    shm_size: "256mb"
+    shm_size: "1024mb"
     build:
       context: .
       dockerfile: docker/main/Dockerfile

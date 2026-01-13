@@ -2,6 +2,9 @@
 
 set -euxo pipefail
 
+# Ensure non-interactive installs inside Docker build / scripts
+export DEBIAN_FRONTEND=noninteractive
+
 apt-get -qq update
 
 apt-get -qq install --no-install-recommends -y \
@@ -20,6 +23,7 @@ apt-get -qq install --no-install-recommends -y \
     libgl1 \
     libglib2.0-0 \
     libusb-1.0.0 \
+    usbutils \
     libgomp1  # memryx detector
 
 update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
@@ -28,6 +32,7 @@ mkdir -p -m 600 /root/.gnupg
 
 # install coral runtime
 wget -q -O /tmp/libedgetpu1-max.deb "https://github.com/feranick/libedgetpu/releases/download/16.0TF2.17.1-1/libedgetpu1-max_16.0tf2.17.1-1.bookworm_${TARGETARCH}.deb"
+# Install the downloaded deb non-interactively; if dependencies are missing, fix them and retry
 unset DEBIAN_FRONTEND
 yes | dpkg -i /tmp/libedgetpu1-max.deb && export DEBIAN_FRONTEND=noninteractive
 rm /tmp/libedgetpu1-max.deb

@@ -5,7 +5,12 @@
       "name": "Python: Launch Frigate",
       "type": "debugpy",
       "request": "launch",
-      "module": "frigate"
+      "module": "frigate",
+      "justMyCode": false,
+      "console": "integratedTerminal", // Add this
+      "env": {
+        "PYTHONUNBUFFERED": "1" // Add this
+      }
     }
   ]
 }

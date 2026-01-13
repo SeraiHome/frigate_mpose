@@ -6,7 +6,7 @@ from collections import defaultdict
 from enum import Enum
 from multiprocessing import Queue as MpQueue
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any, List
+from typing import Any, Dict, List
 
 import cv2
 
@@ -15,12 +15,16 @@ from frigate.comms.detections_updater import DetectionPublisher, DetectionTypeEn
 from frigate.comms.dispatcher import Dispatcher
 from frigate.comms.events_updater import EventEndSubscriber, EventUpdatePublisher
 from frigate.config import FrigateConfig
+from frigate.config.camera import CameraConfig
 from frigate.config.camera.updater import (
     CameraConfigUpdateEnum,
     CameraConfigUpdateSubscriber,
 )
 from frigate.const import FAST_QUEUE_TIMEOUT
 from frigate.events.pose_types import PoseEventStateEnum, PoseEventTypeEnum
+from frigate.pose_activity_detectors import create_activity_detector
+from frigate.pose_activity_detectors.base import PoseActivityDetector
+from frigate.pose_activity_detectors.detector_config import create_detector_config
 from frigate.track.tracked_pose import TrackedPose
 from frigate.util.image import SharedMemoryFrameManager
 
@@ -34,6 +38,13 @@ class PoseProcessingState(str, Enum):
 
 
 class TrackedPoseProcessor(threading.Thread):
+    """
+    Processes tracked poses from pose detectors and assigns appropriate activity detectors.
+
+    Each camera can have its own activity detector configuration, and poses from different
+    cameras will be analyzed with their specific detectors.
+    """
+
     def __init__(
         self,
         config: FrigateConfig,
@@ -50,6 +61,9 @@ class TrackedPoseProcessor(threading.Thread):
         self.ptz_autotracker_thread = ptz_autotracker_thread
         self.camera_states: dict[str, CameraState] = {}
         self.frame_manager = SharedMemoryFrameManager()
+
+        # Activity detectors for each camera
+        self.activity_detectors: Dict[str, PoseActivityDetector] = {}
 
         self.camera_config_subscriber = CameraConfigUpdateSubscriber(
             self.config,
@@ -76,15 +90,166 @@ class TrackedPoseProcessor(threading.Thread):
             lambda: defaultdict(dict)
         )
 
+        # Initialize camera states and activity detectors for enabled cameras with pose detection
         for camera in self.config.cameras.keys():
+            camera_config = self.config.cameras[camera]
             if (
-                camera in self.config.cameras
-                and self.config.cameras[camera].pose.enabled
+                camera_config.enabled
+                and hasattr(camera_config, "pose")
+                and camera_config.pose.enabled
             ):
+                logger.info(
+                    f"Initializing pose tracking and activity detection for camera {camera}"
+                )
                 self.create_camera_state(camera)
+                self.initialize_activity_detector(camera)
+            else:
+                reasons = []
+                if not camera_config.enabled:
+                    reasons.append("camera disabled")
+                if not hasattr(camera_config, "pose") or not camera_config.pose.enabled:
+                    reasons.append("pose detection disabled")
+                if reasons:
+                    logger.debug(
+                        f"Skipping pose activity detection for camera {camera}: {', '.join(reasons)}"
+                    )
+
+    def initialize_activity_detector(self, camera: str) -> None:
+        """
+        Initialize the activity detector for a specific camera based on its configuration.
+        Falls back to heuristic detector if specified detector fails to initialize.
+
+        Args:
+            camera: Camera name to initialize the detector for
+        """
+        if camera not in self.config.cameras:
+            return
+
+        camera_config: CameraConfig = self.config.cameras[camera]
+
+        # Skip if pose detection is not enabled for this camera
+        if not hasattr(camera_config, "pose") or not camera_config.pose.enabled:
+            logger.debug(
+                f"Pose detection not enabled for camera {camera}, skipping activity detector initialization"
+            )
+            return
+
+        # Create detector from camera config
+        if (
+            not hasattr(camera_config.pose, "activity_detector")
+            or not camera_config.pose.activity_detector
+        ):
+            # No specific activity detector configured, use default heuristic detector
+            logger.info(
+                f"No activity detector configured for {camera}, using default heuristic detector"
+            )
+            config_dict = {"type": "heuristic"}
+        else:
+            # Use camera-specific activity detector configuration
+            detector_config = camera_config.pose.activity_detector
+            config_dict = detector_config.model_dump()
+            logger.info(
+                f"Initializing {detector_config.type} activity detector for camera {camera}"
+            )
+
+        # Try to initialize the specified detector
+        success = self._try_initialize_detector(camera, config_dict)
+
+        # Fall back to heuristic detector if the specified detector failed
+        if not success and config_dict.get("type") != "heuristic":
+            logger.warning(
+                f"Specified detector failed, falling back to heuristic detector for camera {camera}"
+            )
+            success = self._try_initialize_detector(camera, {"type": "heuristic"})
+
+            if not success:
+                logger.error(
+                    f"Both primary and fallback detectors failed for camera {camera}. "
+                    f"Pose detection will continue but activity detection will be disabled."
+                )
+
+    def _try_initialize_detector(self, camera: str, config_dict: dict) -> bool:
+        """
+        Attempt to initialize an activity detector with the given configuration.
+
+        Args:
+            camera: Camera name
+            config_dict: Detector configuration dictionary
+
+        Returns:
+            True if initialization was successful, False otherwise
+        """
+        # Create detector configuration
+        detector_config = create_detector_config(config_dict)
+        if detector_config is None:
+            logger.error(f"Failed to create detector configuration for camera {camera}")
+            return False
+
+        # Create activity detector instance
+        try:
+            activity_detector = create_activity_detector(detector_config)
+            if activity_detector and activity_detector.initialized:
+                logger.info(
+                    f"Successfully initialized activity detector for camera {camera}: {detector_config.type}"
+                )
+                self.activity_detectors[camera] = activity_detector
+                return True
+            else:
+                logger.error(
+                    f"Failed to initialize activity detector for camera {camera}"
+                )
+                return False
+        except Exception as e:
+            logger.error(f"Error creating activity detector for camera {camera}: {e}")
+            return False
 
     def create_camera_state(self, camera: str) -> None:
         """Creates a new camera state for pose tracking."""
+
+        from frigate.track.tracked_object import TrackedObject
+
+        class _PoseAdapter:
+            """Adapter to present a TrackedObject or dict as a TrackedPose-like object
+            for the pose processing callbacks.
+            """
+
+            def __init__(self, source):
+                # source may be TrackedPose, TrackedObject, or dict
+                self._source = source
+
+                if isinstance(source, TrackedPose):
+                    return
+
+                if isinstance(source, TrackedObject):
+                    data = source.to_dict()
+                elif isinstance(source, dict):
+                    data = source
+                else:
+                    data = {}
+
+                self.obj_data = data
+                self.previous = getattr(source, "previous", data.copy())
+                self.has_snapshot = data.get("has_snapshot", False)
+                self.has_clip = data.get("has_clip", False)
+                self.false_positive = data.get("false_positive", True)
+                self.entered_zones = set(data.get("entered_zones", []))
+                self.current_zones = set(data.get("current_zones", []))
+
+                # Action may be stored as explicit 'action' or inside sub_label
+                action = data.get("action")
+                if action is None:
+                    sub = data.get("sub_label")
+                    if sub and isinstance(sub, (list, tuple)) and len(sub) > 0:
+                        action = sub[0]
+                self.action = action
+
+                # Confidence may be in action_confidence or score
+                self.confidence = data.get("action_confidence", data.get("score", 0.0))
+
+            def to_dict(self):
+                if isinstance(self._source, TrackedPose):
+                    return self._source.to_dict()
+                return self.obj_data
 
         def start(camera: str, pose: TrackedPose, frame_name: str) -> None:
             self.event_sender.publish(
@@ -93,41 +258,57 @@ class TrackedPoseProcessor(threading.Thread):
                     PoseEventStateEnum.start,
                     camera,
                     frame_name,
-                    pose.to_dict(),
+                    (
+                        pose.to_dict()
+                        if hasattr(pose, "to_dict")
+                        else _PoseAdapter(pose).to_dict()
+                    ),
                 )
             )
 
         def update(camera: str, pose: TrackedPose, frame_name: str) -> None:
-            pose.has_snapshot = self.should_save_pose_snapshot(camera, pose)
-            pose.has_clip = self.should_retain_pose_recording(camera, pose)
-            after = pose.to_dict()
+            adapter = pose if isinstance(pose, TrackedPose) else _PoseAdapter(pose)
+            # set snapshot/clip flags based on adapter
+            try:
+                adapter.has_snapshot = self.should_save_pose_snapshot(camera, adapter)
+            except Exception:
+                adapter.has_snapshot = False
+
+            try:
+                adapter.has_clip = self.should_retain_pose_recording(camera, adapter)
+            except Exception:
+                adapter.has_clip = False
+
+            after = adapter.to_dict() if hasattr(adapter, "to_dict") else {}
             message = {
-                "before": pose.previous,
+                "before": getattr(adapter, "previous", {}),
                 "after": after,
                 "type": "new"
-                if pose.previous.get("false_positive", True)
+                if getattr(adapter, "previous", {}).get("false_positive", True)
                 else "update",
             }
             self.dispatcher.publish("pose_events", json.dumps(message), retain=False)
-            pose.previous = after
+            if hasattr(adapter, "previous"):
+                adapter.previous = after
             self.event_sender.publish(
                 (
                     PoseEventTypeEnum.pose_detected,
                     PoseEventStateEnum.update,
                     camera,
                     frame_name,
-                    pose.to_dict(),
+                    after,
                 )
             )
 
         def end(camera: str, pose: TrackedPose, frame_name: str) -> None:
+            adapter = pose if isinstance(pose, TrackedPose) else _PoseAdapter(pose)
             self.event_sender.publish(
                 (
                     PoseEventTypeEnum.pose_detected,
                     PoseEventStateEnum.end,
                     camera,
                     frame_name,
-                    pose.to_dict(),
+                    adapter.to_dict() if hasattr(adapter, "to_dict") else {},
                 )
             )
 
@@ -198,26 +379,84 @@ class TrackedPoseProcessor(threading.Thread):
 
                 if "enabled" in updated_topics:
                     for camera in updated_topics["enabled"]:
+                        camera_config = self.config.cameras[camera]
+                        current_enabled = camera_config.enabled
+
+                        # If camera is now enabled and has pose detection enabled, initialize activity detector
                         if (
-                            camera in self.camera_states
-                            and self.camera_states[camera].prev_enabled is None
+                            current_enabled
+                            and hasattr(camera_config, "pose")
+                            and camera_config.pose.enabled
                         ):
-                            self.camera_states[
-                                camera
-                            ].prev_enabled = self.config.cameras[camera].enabled
+                            # Create camera state if it doesn't exist
+                            if camera not in self.camera_states:
+                                logger.info(
+                                    f"Camera {camera} now enabled with pose detection, initializing"
+                                )
+                                self.create_camera_state(camera)
+                                self.initialize_activity_detector(camera)
+                            elif (
+                                camera in self.camera_states
+                                and self.camera_states[camera].prev_enabled is None
+                            ):
+                                # Just update prev_enabled if state already exists
+                                self.camera_states[
+                                    camera
+                                ].prev_enabled = current_enabled
+
+                        # If camera is now disabled and had an activity detector, clean it up
+                        elif not current_enabled and camera in self.activity_detectors:
+                            logger.info(
+                                f"Camera {camera} now disabled, cleaning up activity detector"
+                            )
+                            self.activity_detectors.pop(camera)
+
+                        # Update prev_enabled for the camera state if it exists
+                        if camera in self.camera_states:
+                            self.camera_states[camera].prev_enabled = current_enabled
                 elif "add" in updated_topics:
                     for camera in updated_topics["add"]:
+                        # Update the camera config
                         self.config.cameras[camera] = (
                             self.camera_config_subscriber.camera_configs[camera]
                         )
-                        if self.config.cameras[camera].pose.enabled:
+
+                        # Get the updated camera config
+                        camera_config = self.config.cameras[camera]
+
+                        # Only initialize if camera is enabled AND has pose detection enabled
+                        if (
+                            camera_config.enabled
+                            and hasattr(camera_config, "pose")
+                            and camera_config.pose.enabled
+                        ):
+                            logger.info(
+                                f"New camera {camera} added with pose detection enabled, initializing"
+                            )
                             self.create_camera_state(camera)
+                            self.initialize_activity_detector(camera)
+                        else:
+                            reasons = []
+                            if not camera_config.enabled:
+                                reasons.append("camera disabled")
+                            if (
+                                not hasattr(camera_config, "pose")
+                                or not camera_config.pose.enabled
+                            ):
+                                reasons.append("pose detection disabled")
+                            if reasons:
+                                logger.debug(
+                                    f"Skipping pose activity detection for new camera {camera}: {', '.join(reasons)}"
+                                )
                 elif "remove" in updated_topics:
                     for camera in updated_topics["remove"]:
                         if camera in self.camera_states:
                             camera_state = self.camera_states[camera]
                             camera_state.shutdown()
                             self.camera_states.pop(camera)
+                        # Clean up activity detector
+                        if camera in self.activity_detectors:
+                            self.activity_detectors.pop(camera)
 
                 # Manage camera disabled state
                 for camera, config in self.config.cameras.items():
@@ -296,10 +535,31 @@ class TrackedPoseProcessor(threading.Thread):
 
                 # Process tracked poses
                 try:
-                    # Update pose zones before sending to camera state
+                    # Get camera's activity detector
+                    activity_detector = self.activity_detectors.get(camera)
+                    if (
+                        activity_detector is None
+                        and camera not in self.activity_detectors
+                    ):
+                        # Try to initialize the detector if it doesn't exist
+                        self.initialize_activity_detector(camera)
+                        activity_detector = self.activity_detectors.get(camera)
+
+                    # Update pose zones and trigger action analysis before sending to camera state
                     for pose in tracked_poses:
                         if isinstance(pose, TrackedPose):
                             self._update_pose_zones(camera, pose)
+                            # Set the camera name for the pose if not already set
+                            if not pose.camera_name:
+                                pose.camera_name = camera
+
+                            # Assign the appropriate activity detector to this pose
+                            if activity_detector and activity_detector.initialized:
+                                pose.active_detector = activity_detector
+
+                            # Force update to ensure pose action analysis is triggered
+                            # This ensures _analyze_pose_action is called for every processed pose
+                            pose.update(pose.keypoints, pose.confidence, pose.bbox)
 
                     # Convert tracked poses list to a dictionary keyed by pose ID
                     # CameraState.update expects a dictionary with keys, not a list
@@ -330,12 +590,26 @@ class TrackedPoseProcessor(threading.Thread):
                             if pose.bbox and len(pose.bbox) == 4:
                                 x, y, w, h = pose.bbox
                                 pose_dict["box"] = [x, y, x + w, y + h]
+                                # compute centroid as center of box
+                                try:
+                                    cx = int(
+                                        (pose_dict["box"][0] + pose_dict["box"][2])
+                                        / 2.0
+                                    )
+                                    cy = int(
+                                        (pose_dict["box"][1] + pose_dict["box"][3])
+                                        / 2.0
+                                    )
+                                except Exception:
+                                    cx, cy = 0, 0
+                                pose_dict["centroid"] = (cx, cy)
                                 pose_dict["area"] = w * h
                                 pose_dict["ratio"] = w / h if h > 0 else 1.0
                                 pose_dict["region"] = [0, 0, 0, 0]  # Default region
                             else:
                                 # Default values if no bbox
                                 pose_dict["box"] = [0, 0, 10, 10]
+                                pose_dict["centroid"] = (5, 5)
                                 pose_dict["area"] = 100
                                 pose_dict["ratio"] = 1.0
                                 pose_dict["region"] = [0, 0, 0, 0]
@@ -354,6 +628,9 @@ class TrackedPoseProcessor(threading.Thread):
                             else:
                                 # Generate a unique ID if none exists
                                 pose_id = f"pose_{len(tracked_poses_dict)}"
+
+                            # Ensure the dict has an explicit id field matching the key
+                            pose_dict["id"] = pose_id
 
                             # Add required fields if they don't exist
                             pose_dict.setdefault(
@@ -374,10 +651,23 @@ class TrackedPoseProcessor(threading.Thread):
                             if "bbox" in pose and "box" not in pose:
                                 x, y, w, h = pose["bbox"]
                                 pose_dict["box"] = [x, y, x + w, y + h]
+                                try:
+                                    cx = int(
+                                        (pose_dict["box"][0] + pose_dict["box"][2])
+                                        / 2.0
+                                    )
+                                    cy = int(
+                                        (pose_dict["box"][1] + pose_dict["box"][3])
+                                        / 2.0
+                                    )
+                                except Exception:
+                                    cx, cy = 0, 0
+                                pose_dict["centroid"] = (cx, cy)
                                 pose_dict["area"] = w * h
                                 pose_dict["ratio"] = w / h if h > 0 else 1.0
                             elif "box" not in pose:
                                 pose_dict["box"] = [0, 0, 10, 10]
+                                pose_dict["centroid"] = (5, 5)
                                 pose_dict["area"] = 100
                                 pose_dict["ratio"] = 1.0
 
