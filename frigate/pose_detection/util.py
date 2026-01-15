@@ -17,8 +17,19 @@ def tensor_transform(input_tensor: InputTensorEnum):
         return None
 
 
+from .tensor_utils import (
+    POSE_BBOX_END,
+    POSE_BBOX_START,
+    POSE_KEYPOINTS_END,
+    extract_keypoints_from_pose_output,
+)
+
+
 def format_pose_output(raw_poses, threshold=0.4):
-    """Format raw pose detection output into standardized format."""
+    """Format raw pose detection output into standardized format.
+
+    Uses optimized tensor utilities for keypoint extraction.
+    """
     formatted_poses = []
 
     for pose in raw_poses:
@@ -31,15 +42,14 @@ def format_pose_output(raw_poses, threshold=0.4):
             "keypoints": [],
             "bbox": None,
         }
-
-        # Extract keypoints (assuming COCO format: 17 keypoints * 3 values each)
-        if len(pose) >= 53:  # 2 + 17*3 = 53 minimum
-            keypoints = pose[2:53].reshape(-1, 3)
+        # Extract keypoints using optimized helper (returns view)
+        if len(pose) >= POSE_KEYPOINTS_END:
+            keypoints = extract_keypoints_from_pose_output(pose)
             formatted_pose["keypoints"] = keypoints.tolist()
 
         # Extract bounding box if available
-        if len(pose) >= 57:  # 53 + 4 bbox values
-            formatted_pose["bbox"] = pose[53:57].tolist()
+        if len(pose) >= POSE_BBOX_END:
+            formatted_pose["bbox"] = pose[POSE_BBOX_START:POSE_BBOX_END].tolist()
 
         formatted_poses.append(formatted_pose)
 
@@ -48,41 +58,59 @@ def format_pose_output(raw_poses, threshold=0.4):
 
 def calculate_pose_bbox(keypoints, confidence_threshold=0.3):
     """Calculate bounding box from keypoints."""
-    if not keypoints or len(keypoints) == 0:
+    if keypoints is None or (isinstance(keypoints, np.ndarray) and keypoints.size == 0):
         return None
 
-    # Filter keypoints with sufficient confidence
-    valid_keypoints = []
-    for kp in keypoints:
-        if len(kp) >= 3 and kp[2] > confidence_threshold:
-            valid_keypoints.append([kp[0], kp[1]])
+    if not isinstance(keypoints, np.ndarray):
+        keypoints = np.asarray(keypoints)
 
-    if len(valid_keypoints) < 2:
+    # Ensure 2D shape
+    if keypoints.ndim == 1:
+        keypoints = keypoints.reshape(-1, 3)
+
+    if keypoints.shape[0] < 2:
         return None
 
-    valid_keypoints = np.array(valid_keypoints)
+    # Filter keypoints with sufficient confidence using vectorized operations
+    conf_mask = keypoints[:, 2] > confidence_threshold
+    valid_count = np.sum(conf_mask)
 
-    # Calculate bounding box
-    x_min = np.min(valid_keypoints[:, 0])
-    y_min = np.min(valid_keypoints[:, 1])
-    x_max = np.max(valid_keypoints[:, 0])
-    y_max = np.max(valid_keypoints[:, 1])
+    if valid_count < 2:
+        return None
+
+    valid_keypoints = keypoints[conf_mask, :2]
+
+    # Calculate bounding box using vectorized min/max
+    x_min, y_min = np.min(valid_keypoints, axis=0)
+    x_max, y_max = np.max(valid_keypoints, axis=0)
 
     return [x_min, y_min, x_max, y_max]
 
 
 def pose_similarity(pose1, pose2, threshold=0.5):
-    """Calculate similarity between two poses based on keypoint positions."""
-    if not pose1.get("keypoints") or not pose2.get("keypoints"):
+    """Calculate similarity between two poses based on keypoint positions.
+
+    Optimized with efficient array handling.
+    """
+    kp1_raw = pose1.get("keypoints")
+    kp2_raw = pose2.get("keypoints")
+
+    if kp1_raw is None or kp2_raw is None:
         return 0.0
 
-    kp1 = np.array(pose1["keypoints"])
-    kp2 = np.array(pose2["keypoints"])
+    kp1 = np.asarray(kp1_raw, dtype=np.float32)
+    kp2 = np.asarray(kp2_raw, dtype=np.float32)
 
-    if kp1.shape != kp2.shape or len(kp1.shape) != 2 or kp1.shape[1] < 2:
+    # Ensure both are 2D
+    if kp1.ndim == 1:
+        kp1 = kp1.reshape(-1, 3)
+    if kp2.ndim == 1:
+        kp2 = kp2.reshape(-1, 3)
+
+    if kp1.shape != kp2.shape or kp1.ndim != 2 or kp1.shape[1] < 3:
         return 0.0
 
-    # Only compare keypoints with sufficient confidence
+    # Only compare keypoints with sufficient confidence (vectorized)
     valid_mask = (kp1[:, 2] > threshold) & (kp2[:, 2] > threshold)
 
     if not np.any(valid_mask):

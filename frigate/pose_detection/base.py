@@ -26,6 +26,12 @@ from frigate.util.builtin import EventsPerSecond, load_labels
 from frigate.util.image import SharedMemoryFrameManager, UntrackedSharedMemory
 from frigate.util.process import FrigateProcess
 
+from .tensor_utils import (
+    ensure_batch_nhwc,
+    ensure_rgb_hwc,
+    extract_keypoints_from_pose_output,
+    is_yuv_frame,
+)
 from .util import tensor_transform
 
 logger = logging.getLogger(__name__)
@@ -76,19 +82,17 @@ class BaseLocalPoseDetector(PoseDetector):
         raw_poses = self.detect_raw(tensor_input)
 
         for pose in raw_poses:
-            # pose format: [person_id, confidence, keypoints...]
+            # pose format: [person_id, confidence, keypoints(51), bbox(4)]
             if pose[1] < threshold:
                 break
+            # Use extract_keypoints to get (17, 3) view without copy
+            keypoints = extract_keypoints_from_pose_output(pose)
             poses.append(
                 {
                     "person_id": int(pose[0]),
                     "confidence": float(pose[1]),
-                    "keypoints": pose[2:].reshape(
-                        -1, 3
-                    ),  # reshape to (num_keypoints, 3) for x,y,confidence
-                    "bbox": pose[-4:]
-                    if len(pose) > 2
-                    else None,  # bounding box if available
+                    "keypoints": keypoints,
+                    "bbox": pose[53:57] if len(pose) >= 57 else None,
                 }
             )
         self.fps.update()
@@ -708,19 +712,19 @@ class RemotePoseDetector:
                 )
                 return poses
 
-            # Process detection results
+            # Process detection results using optimized extraction
             for pose_data in self.out_np_shm:
                 if pose_data[1] < threshold:
                     break
 
+                # Use extract_keypoints for view-based access (no copy)
+                keypoints = extract_keypoints_from_pose_output(pose_data)
                 poses.append(
                     {
                         "person_id": int(pose_data[0]),
                         "confidence": float(pose_data[1]),
-                        "keypoints": pose_data[2:53].reshape(
-                            -1, 3
-                        ),  # 17 keypoints * 3 = 51
-                        "bbox": pose_data[53:57] if len(pose_data) > 53 else None,
+                        "keypoints": keypoints,
+                        "bbox": pose_data[53:57] if len(pose_data) >= 57 else None,
                     }
                 )
 
@@ -738,50 +742,41 @@ class RemotePoseDetector:
         """Preprocess input tensor for pose detection.
 
         Handles YUV to RGB conversion, resizing, and ensuring proper format.
+        Optimized to minimize redundant shape checks and copies.
 
         Args:
             tensor_input: Input image tensor
 
         Returns:
-            Preprocessed tensor ready for pose detection
+            Preprocessed tensor ready for pose detection with shape (1, H, W, 3)
         """
         try:
             import cv2
 
             from frigate.util.image import yuv_region_2_rgb
 
-            # Check if this is a YUV frame
-            is_yuv = False
-            if len(tensor_input.shape) == 2:  # 2D YUV format
-                is_yuv = True
-                height = tensor_input.shape[0]
-                width = tensor_input.shape[1]
-            elif (
-                len(tensor_input.shape) == 3
-                and tensor_input.shape[0] > tensor_input.shape[1] * 1.2
-            ):
-                # Another way to detect YUV: height is ~1.5x width for I420 format
-                is_yuv = True
-                height = tensor_input.shape[0]
-                width = tensor_input.shape[1]
-
-            # Convert YUV to RGB if needed
-            if is_yuv:
-                region = (0, 0, width, height)
-                tensor_input = yuv_region_2_rgb(tensor_input, region)
-
-            # Handle 2D grayscale inputs (expand to 3 channels)
-            if len(tensor_input.shape) == 2:
-                tensor_input = np.stack(
-                    [tensor_input, tensor_input, tensor_input], axis=2
-                )
-
-            # Get input and buffer dimensions
-            input_height, input_width = tensor_input.shape[:2]
             buffer_height = self.model_config.height
             buffer_width = self.model_config.width
 
+            # Fast path: already in correct NHWC format with right dimensions
+            if tensor_input.ndim == 4 and tensor_input.shape[1:] == (
+                buffer_height,
+                buffer_width,
+                3,
+            ):
+                return tensor_input
+
+            # Check YUV format using helper
+            if is_yuv_frame(tensor_input):
+                height, width = tensor_input.shape[:2]
+                region = (0, 0, width, height)
+                tensor_input = yuv_region_2_rgb(tensor_input, region)
+
+            # Ensure HWC format (removes batch dim if present, handles grayscale)
+            tensor_input = ensure_rgb_hwc(tensor_input)
+
             # Resize if needed
+            input_height, input_width = tensor_input.shape[:2]
             if (input_height, input_width) != (buffer_height, buffer_width):
                 tensor_input = cv2.resize(
                     tensor_input,
@@ -789,23 +784,8 @@ class RemotePoseDetector:
                     interpolation=cv2.INTER_LINEAR,
                 )
 
-            # Ensure tensor has 3 RGB channels
-            if len(tensor_input.shape) == 3 and tensor_input.shape[2] != 3:
-                if tensor_input.shape[2] == 1:  # Single channel grayscale
-                    tensor_input = np.repeat(tensor_input, 3, axis=2)
-                else:  # Other channel count
-                    channels = min(tensor_input.shape[2], 3)
-                    new_tensor = np.zeros(
-                        (buffer_height, buffer_width, 3), dtype=np.uint8
-                    )
-                    new_tensor[:, :, :channels] = tensor_input[:, :, :channels]
-                    tensor_input = new_tensor
-
             # Add batch dimension for model input (NHWC format)
-            if len(tensor_input.shape) == 3:
-                tensor_input = np.expand_dims(tensor_input, axis=0)
-
-            return tensor_input
+            return ensure_batch_nhwc(tensor_input)
 
         except Exception as e:
             camera_name = self.name[5:] if self.name.startswith("pose-") else self.name

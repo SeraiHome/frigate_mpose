@@ -7,6 +7,11 @@ import numpy as np
 
 from frigate.config import CameraConfig
 from frigate.pose_detection.base import RemotePoseDetector
+from frigate.pose_detection.tensor_utils import (
+    COCO_NUM_KEYPOINTS,
+    ensure_keypoints_2d,
+    is_yuv_frame,
+)
 from frigate.pose_detectors.detector_config import PoseModelConfig
 from frigate.track.tracked_pose import TrackedPose
 from frigate.util.image import yuv_region_2_rgb
@@ -80,8 +85,26 @@ class PoseDetectionIntegration:
             self.pose_detector = None
 
     def detect_poses(self, frame, frame_time, motion_boxes, regions):
-        """Detect poses in the frame."""
+        """Detect poses in the frame.
+
+        Applies motion-based filtering to avoid unnecessary pose detection
+        when the scene is static. This is critical for performance.
+
+        Motion filtering only skips detection when NO motion is detected.
+        When object detection is disabled, regions will be empty but that
+        should not prevent pose detection if there is motion.
+        """
         if not self.pose_config.enabled or self.pose_detector is None:
+            return []
+
+        # Performance optimization: skip pose detection if no motion detected
+        # This prevents wasting CPU/GPU cycles on static scenes.
+        # Note: We only require motion_boxes to have content. Regions may be
+        # empty when object detection is disabled, which is fine.
+        if not motion_boxes:
+            logger.debug(
+                f"Skipping pose detection for {self.camera_name}: no motion detected"
+            )
             return []
 
         detected_poses = []
@@ -201,26 +224,36 @@ class PoseDetectionIntegration:
         Returns a tuple: (rgb_frame, region). `region` is the (x_min,y_min,x_max,y_max)
         rectangle in the original frame that was used to produce `rgb_frame`.
         If no explicit region was used, `region` will cover the full frame.
+
+        Optimized to minimize redundant shape checks.
         """
         try:
             # Log frame shape for debugging
             logger.debug(f"frame.shape: {frame.shape}")
 
+            frame_ndim = frame.ndim
+
             # Already in RGB format (3D with appropriate dimensions)
-            if len(frame.shape) == 3 and not (frame.shape[0] > frame.shape[1] * 1.2):
+            if (
+                frame_ndim == 3
+                and frame.shape[2] == 3
+                and frame.shape[0] <= frame.shape[1] * 1.2
+            ):
                 h, w = frame.shape[:2]
                 return frame, (0, 0, w, h)
 
             # Handle YUV conversion - create square regions to avoid dimension mismatch
-
-            # For 2D YUV frames
-            if len(frame.shape) == 2:
-                # For I420 format, Y plane height is 2/3 of the total height
-                y_height = int(frame.shape[0] * 2 / 3)
-                frame_width = frame.shape[1]
+            if is_yuv_frame(frame):
+                if frame_ndim == 2:
+                    # For I420 format, Y plane height is 2/3 of the total height
+                    y_height = int(frame.shape[0] * 2 / 3)
+                    frame_width = frame.shape[1]
+                else:
+                    # 3D YUV
+                    y_height = frame.shape[0]
+                    frame_width = frame.shape[1]
 
                 # Calculate dimensions for a square region
-                # Use the smaller dimension as the size of our square
                 square_size = min(frame_width, y_height)
 
                 # Center the square region
@@ -228,20 +261,18 @@ class PoseDetectionIntegration:
                 y_center = y_height // 2
 
                 # Create square region centered in the frame
+                half_size = square_size // 2
                 region = (
-                    max(0, x_center - square_size // 2),  # x_min
-                    max(0, y_center - square_size // 2),  # y_min
-                    min(frame_width, x_center + square_size // 2),  # x_max
-                    min(y_height, y_center + square_size // 2),  # y_max
+                    max(0, x_center - half_size),
+                    max(0, y_center - half_size),
+                    min(frame_width, x_center + half_size),
+                    min(y_height, y_center + half_size),
                 )
-                logger.debug(f"region: {region}")
 
-                # Ensure the region dimensions are equal (square)
+                # Ensure square dimensions
                 region_width = region[2] - region[0]
                 region_height = region[3] - region[1]
-
                 if region_width != region_height:
-                    # Adjust to ensure square dimensions
                     new_size = min(region_width, region_height)
                     region = (
                         region[0],
@@ -250,31 +281,7 @@ class PoseDetectionIntegration:
                         region[1] + new_size,
                     )
 
-                # Convert YUV to RGB with square region
-                return yuv_region_2_rgb(frame, region), region
-
-            # For 3D YUV format
-            elif len(frame.shape) == 3:
-                frame_height = frame.shape[0]
-                frame_width = frame.shape[1]
-
-                # Calculate dimensions for a square region
-                square_size = min(frame_width, frame_height)
-
-                # Center the square region
-                x_center = frame_width // 2
-                y_center = frame_height // 2
-
-                # Create square region centered in the frame
-                region = (
-                    max(0, x_center - square_size // 2),  # x_min
-                    max(0, y_center - square_size // 2),  # y_min
-                    min(frame_width, x_center + square_size // 2),  # x_max
-                    min(frame_height, y_center + square_size // 2),  # y_max
-                )
                 logger.debug(f"region: {region}")
-
-                # Convert YUV to RGB with square region
                 return yuv_region_2_rgb(frame, region), region
 
             # If we can't determine the format, return as is
@@ -287,7 +294,7 @@ class PoseDetectionIntegration:
             )
             # Create a fallback grayscale RGB image from Y plane if possible
             try:
-                if len(frame.shape) == 2:
+                if frame.ndim == 2:
                     # For 2D YUV, extract just the Y plane as grayscale
                     y_height = int(frame.shape[0] * 2 / 3)
                     y_plane = frame[:y_height]
@@ -297,12 +304,9 @@ class PoseDetectionIntegration:
                         frame.shape[1],
                         y_height,
                     )
-                elif len(frame.shape) >= 3:
+                elif frame.ndim >= 3:
                     # For 3D, take first channel or first slice as grayscale
-                    if frame.shape[2] >= 1:
-                        y_plane = frame[:, :, 0]
-                    else:
-                        y_plane = frame[:, :]
+                    y_plane = frame[:, :, 0] if frame.shape[2] >= 1 else frame[:, :]
                     return np.stack([y_plane, y_plane, y_plane], axis=2), (
                         0,
                         0,
@@ -356,17 +360,8 @@ class PoseDetectionIntegration:
             else:
                 keypoints = pose["keypoints"]
 
-            # Ensure keypoints shaped (17,3) when flattened (51,) or list
-            if (
-                isinstance(keypoints, np.ndarray)
-                and keypoints.ndim == 1
-                and keypoints.size == 51
-            ):
-                try:
-                    keypoints = keypoints.reshape((17, 3))
-                except Exception:
-                    # fallback: try to reshape to (-1, 3)
-                    keypoints = keypoints.reshape((-1, 3))
+            # Ensure keypoints in canonical (17, 3) shape using optimized helper
+            keypoints = ensure_keypoints_2d(keypoints, COCO_NUM_KEYPOINTS)
 
             # Compute detection centroid. Prefer bbox when available (more
             # stable across detectors). Bbox is expected as [x,y,w,h]; if
@@ -423,13 +418,8 @@ class PoseDetectionIntegration:
                         )
                         t_centroid = np.array([tbx + tbw / 2.0, tby + tbh / 2.0])
                     else:
-                        t_kp = tpose.keypoints
-                        if (
-                            isinstance(t_kp, np.ndarray)
-                            and t_kp.ndim == 1
-                            and t_kp.size == 51
-                        ):
-                            t_kp = t_kp.reshape((17, 3))
+                        # Use helper to ensure tracked keypoints are (17, 3)
+                        t_kp = ensure_keypoints_2d(tpose.keypoints, COCO_NUM_KEYPOINTS)
                         t_vis = t_kp[:, 2] > 0.1
                         if np.any(t_vis):
                             t_centroid = np.mean(t_kp[t_vis, :2], axis=0)

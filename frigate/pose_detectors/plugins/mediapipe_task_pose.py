@@ -8,6 +8,11 @@ import cv2
 import numpy as np
 
 import frigate.const as const
+from frigate.pose_detection.tensor_utils import (
+    create_pose_output,
+    create_pose_output_batch,
+    is_yuv_frame,
+)
 from frigate.pose_detectors.detection_api import PoseDetectionApi
 from frigate.pose_detectors.detector_config import (
     BasePoseDetectorConfig,
@@ -171,28 +176,32 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
         logger.info("MediaPipe task pose detector initialized")
 
     def detect_raw(self, tensor_input, camera_name=None):
-        """Run MediaPipe pose detection on input tensor using the Task API."""
+        """Run MediaPipe pose detection on input tensor using the Task API.
+
+        Optimized with reduced shape checks and unified YUV detection.
+        """
         try:
             self.frame_count += 1
             self.frame_ts = int((time() - self.t0) * 1000)
-            # Convert tensor to image format expected by MediaPipe
-            if len(tensor_input.shape) == 4:
-                image = tensor_input[0]  # Remove batch dimension
-            else:
-                image = tensor_input
+
+            # Remove batch dimension if present
+            image = tensor_input[0] if tensor_input.ndim == 4 else tensor_input
 
             # Process input according to its format
             try:
-                # Already in RGB format (3D with appropriate dimensions)
-                if len(image.shape) == 3 and image.shape[2] == 3:
-                    # Input is already RGB (per config.yml input_pixel_format: rgb)
+                # Fast path: already in RGB format (3D with 3 channels)
+                if image.ndim == 3 and image.shape[2] == 3 and not is_yuv_frame(image):
                     image_rgb = image.astype(np.uint8)
 
                 # Handle YUV conversion - create square regions to avoid dimension mismatch
-                elif len(image.shape) == 2:
-                    # For I420 format, Y plane height is 2/3 of total height
-                    y_height = int(image.shape[0] * 2 / 3)
-                    frame_width = image.shape[1]
+                elif is_yuv_frame(image):
+                    if image.ndim == 2:
+                        # For I420 format, Y plane height is 2/3 of total height
+                        y_height = int(image.shape[0] * 2 / 3)
+                        frame_width = image.shape[1]
+                    else:
+                        y_height = image.shape[0]
+                        frame_width = image.shape[1]
 
                     # Calculate dimensions for a square region
                     square_size = min(frame_width, y_height)
@@ -200,6 +209,7 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
                     # Center the square region
                     x_center = frame_width // 2
                     y_center = y_height // 2
+                    half_size = square_size // 2
 
                     # Create square region centered in the frame
                     region = (
@@ -369,95 +379,88 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
             logger.error(
                 "Try setting a custom model_path or run with elevated permissions."
             )
-            return np.zeros((20, 57), dtype=np.float32)
+            return create_pose_output_batch()
         except Exception as e:
             logger.error(f"MediaPipe pose detection failed: {e}")
-            return np.zeros((20, 57), dtype=np.float32)
+            return create_pose_output_batch()
+
+    # Class-level mapping from MediaPipe to COCO format (computed once)
+    _MP_TO_COCO_MAP = {
+        0: 0,  # nose
+        2: 1,  # left_eye
+        5: 2,  # right_eye
+        7: 3,  # left_ear
+        8: 4,  # right_ear
+        11: 5,  # left_shoulder
+        12: 6,  # right_shoulder
+        13: 7,  # left_elbow
+        14: 8,  # right_elbow
+        15: 9,  # left_wrist
+        16: 10,  # right_wrist
+        23: 11,  # left_hip
+        24: 12,  # right_hip
+        25: 13,  # left_knee
+        26: 14,  # right_knee
+        27: 15,  # left_ankle
+        28: 16,  # right_ankle
+    }
 
     def _postprocess_mediapipe_pose(self, results, image_shape):
-        """Post-process MediaPipe task API pose results."""
-        poses = []
+        """Post-process MediaPipe task API pose results using optimized tensor utilities."""
+        # Start with pre-allocated output array
+        result = create_pose_output_batch()
 
-        if results.pose_landmarks:
-            height, width = image_shape[:2]
+        if not results.pose_landmarks:
+            return result
 
-            # Process each detected pose
-            for pose_idx, landmarks in enumerate(results.pose_landmarks):
-                # MediaPipe returns 33 landmarks, but we'll use the COCO 17 keypoints
-                # Mapping from MediaPipe to COCO format
-                mp_to_coco_map = {
-                    0: 0,  # nose
-                    2: 1,  # left_eye
-                    5: 2,  # right_eye
-                    7: 3,  # left_ear
-                    8: 4,  # right_ear
-                    11: 5,  # left_shoulder
-                    12: 6,  # right_shoulder
-                    13: 7,  # left_elbow
-                    14: 8,  # right_elbow
-                    15: 9,  # left_wrist
-                    16: 10,  # right_wrist
-                    23: 11,  # left_hip
-                    24: 12,  # right_hip
-                    25: 13,  # left_knee
-                    26: 14,  # right_knee
-                    27: 15,  # left_ankle
-                    28: 16,  # right_ankle
-                }
+        height, width = image_shape[:2]
 
-                keypoints = np.zeros(51, dtype=np.float32)  # 17 keypoints * 3
+        # Process each detected pose (up to max 20)
+        for pose_idx, landmarks in enumerate(results.pose_landmarks[:20]):
+            keypoints = np.zeros(51, dtype=np.float32)  # 17 keypoints * 3
+            valid_points = []
 
-                for mp_idx, coco_idx in mp_to_coco_map.items():
-                    if mp_idx < len(landmarks):
-                        landmark = landmarks[mp_idx]
-                        # Convert normalized coordinates to pixel coordinates
-                        x = landmark.x * width
-                        y = landmark.y * height
-                        confidence = (
-                            landmark.visibility
-                        )  # MediaPipe uses visibility as confidence
+            for mp_idx, coco_idx in self._MP_TO_COCO_MAP.items():
+                if mp_idx < len(landmarks):
+                    landmark = landmarks[mp_idx]
+                    # Convert normalized coordinates to pixel coordinates
+                    x = landmark.x * width
+                    y = landmark.y * height
+                    confidence = landmark.visibility
 
-                        keypoints[coco_idx * 3] = x
-                        keypoints[coco_idx * 3 + 1] = y
-                        keypoints[coco_idx * 3 + 2] = confidence
+                    base_idx = coco_idx * 3
+                    keypoints[base_idx] = x
+                    keypoints[base_idx + 1] = y
+                    keypoints[base_idx + 2] = confidence
 
-                # Calculate bounding box from keypoints
-                valid_points = []
-                for i in range(17):
-                    if (
-                        keypoints[i * 3 + 2] > self.min_detection_confidence
-                    ):  # confidence threshold
-                        valid_points.append([keypoints[i * 3], keypoints[i * 3 + 1]])
+                    if confidence > self.min_detection_confidence:
+                        valid_points.append([x, y])
 
-                bbox = [0, 0, 0, 0]
-                if valid_points:
-                    valid_points = np.array(valid_points)
-                    x_min, y_min = np.min(valid_points, axis=0)
-                    x_max, y_max = np.max(valid_points, axis=0)
-                    bbox = [x_min, y_min, x_max - x_min, y_max - y_min]  # x, y, w, h
+            # Calculate bounding box from valid keypoints
+            bbox = np.array([0, 0, 0, 0], dtype=np.float32)
+            if valid_points:
+                valid_arr = np.array(valid_points, dtype=np.float32)
+                x_min, y_min = np.min(valid_arr, axis=0)
+                x_max, y_max = np.max(valid_arr, axis=0)
+                bbox = np.array(
+                    [x_min, y_min, x_max - x_min, y_max - y_min], dtype=np.float32
+                )
 
-                # Overall pose confidence (average of visible keypoints or use the pose score if available)
-                if hasattr(results, "pose_score") and results.pose_score:
-                    pose_confidence = results.pose_score[pose_idx]
-                else:
-                    visible_keypoints = [
-                        kp for i, kp in enumerate(keypoints[2::3]) if kp > 0.3
-                    ]
-                    pose_confidence = (
-                        np.mean(visible_keypoints) if visible_keypoints else 0.0
-                    )
+            # Overall pose confidence
+            if hasattr(results, "pose_score") and results.pose_score:
+                pose_confidence = float(results.pose_score[pose_idx])
+            else:
+                conf_vals = keypoints[2::3]
+                visible_mask = conf_vals > 0.3
+                pose_confidence = (
+                    float(np.mean(conf_vals[visible_mask]))
+                    if np.any(visible_mask)
+                    else 0.0
+                )
 
-                # Format output: [person_id, confidence, keypoints(51), bbox(4)]
-                pose_output = np.zeros(57, dtype=np.float32)
-                pose_output[0] = pose_idx  # person_id
-                pose_output[1] = pose_confidence
-                pose_output[2:53] = keypoints
-                pose_output[53:57] = bbox
-                poses.append(pose_output)
-
-        # Pad to fixed size (20 poses max)
-        result = np.zeros((20, 57), dtype=np.float32)
-        for i, pose in enumerate(poses[:20]):
-            result[i] = pose
+            # Use helper to create standardized output
+            result[pose_idx] = create_pose_output(
+                pose_idx, pose_confidence, keypoints, bbox
+            )
 
         return result

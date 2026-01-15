@@ -9,6 +9,11 @@ import cv2
 import numpy as np
 
 import frigate.const as const
+from frigate.pose_detection.tensor_utils import (
+    create_pose_output,
+    create_pose_output_batch,
+    is_yuv_frame,
+)
 from frigate.pose_detectors.detection_api import PoseDetectionApi
 from frigate.pose_detectors.detector_config import (
     BasePoseDetectorConfig,
@@ -236,51 +241,52 @@ class MediaPipePoseApi(PoseDetectionApi):
         logger.info("MediaPipe pose detector initialized")
 
     def detect_raw(self, tensor_input, camera_name=None):
-        """Run MediaPipe pose detection on input tensor."""
+        """Run MediaPipe pose detection on input tensor.
+
+        Optimized with reduced shape checks and unified YUV detection.
+        """
         try:
             self.frame_count += 1
 
-            # Convert tensor to image format expected by MediaPipe
-            if len(tensor_input.shape) == 4:
-                image = tensor_input[0]  # Remove batch dimension
-            else:
-                image = tensor_input
+            # Remove batch dimension if present
+            image = tensor_input[0] if tensor_input.ndim == 4 else tensor_input
 
             # Process input according to its format
             try:
-                # Already in RGB format (3D with appropriate dimensions)
-                if len(image.shape) == 3 and image.shape[2] == 3:
-                    # Input is already RGB (per config.yml input_pixel_format: rgb)
+                # Fast path: already in RGB format (3D with 3 channels)
+                if image.ndim == 3 and image.shape[2] == 3 and not is_yuv_frame(image):
                     image_rgb = image.astype(np.uint8)
 
                 # Handle YUV conversion - create square regions to avoid dimension mismatch
-                elif len(image.shape) == 2:
-                    # For I420 format, Y plane height is 2/3 of total height
-                    y_height = int(image.shape[0] * 2 / 3)
-                    frame_width = image.shape[1]
+                elif is_yuv_frame(image):
+                    if image.ndim == 2:
+                        # For I420 format, Y plane height is 2/3 of total height
+                        y_height = int(image.shape[0] * 2 / 3)
+                        frame_width = image.shape[1]
+                    else:
+                        y_height = image.shape[0]
+                        frame_width = image.shape[1]
 
                     # Calculate dimensions for a square region
-                    # Use the smaller dimension as the size of our square
                     square_size = min(frame_width, y_height)
 
                     # Center the square region
                     x_center = frame_width // 2
                     y_center = y_height // 2
+                    half_size = square_size // 2
 
                     # Create square region centered in the frame
                     region = (
-                        max(0, x_center - square_size // 2),  # x_min
-                        max(0, y_center - square_size // 2),  # y_min
-                        min(frame_width, x_center + square_size // 2),  # x_max
-                        min(y_height, y_center + square_size // 2),  # y_max
+                        max(0, x_center - half_size),
+                        max(0, y_center - half_size),
+                        min(frame_width, x_center + half_size),
+                        min(y_height, y_center + half_size),
                     )
 
-                    # Ensure the region dimensions are equal (square)
+                    # Ensure square dimensions
                     region_width = region[2] - region[0]
                     region_height = region[3] - region[1]
-
                     if region_width != region_height:
-                        # Adjust to ensure square dimensions
                         new_size = min(region_width, region_height)
                         region = (
                             region[0],
@@ -391,83 +397,77 @@ class MediaPipePoseApi(PoseDetectionApi):
             return np.zeros((20, 57), dtype=np.float32)
 
     def _postprocess_mediapipe_pose(self, results, image_shape):
-        """Post-process MediaPipe pose results."""
-        poses = []
+        """Post-process MediaPipe pose results using optimized tensor utilities."""
+        # Start with pre-allocated output array
+        result = create_pose_output_batch()
 
-        if results.pose_landmarks:
-            height, width = image_shape[:2]
+        if not results.pose_landmarks:
+            return result
 
-            # Extract landmarks
-            landmarks = results.pose_landmarks.landmark
+        height, width = image_shape[:2]
 
-            # MediaPipe returns 33 landmarks, but we'll use the COCO 17 keypoints
-            # Mapping from MediaPipe to COCO format
-            mp_to_coco_map = {
-                0: 0,  # nose
-                2: 1,  # left_eye
-                5: 2,  # right_eye
-                7: 3,  # left_ear
-                8: 4,  # right_ear
-                11: 5,  # left_shoulder
-                12: 6,  # right_shoulder
-                13: 7,  # left_elbow
-                14: 8,  # right_elbow
-                15: 9,  # left_wrist
-                16: 10,  # right_wrist
-                23: 11,  # left_hip
-                24: 12,  # right_hip
-                25: 13,  # left_knee
-                26: 14,  # right_knee
-                27: 15,  # left_ankle
-                28: 16,  # right_ankle
-            }
+        # Extract landmarks
+        landmarks = results.pose_landmarks.landmark
 
-            keypoints = np.zeros(51, dtype=np.float32)  # 17 keypoints * 3
+        # MediaPipe returns 33 landmarks, but we'll use the COCO 17 keypoints
+        # Mapping from MediaPipe to COCO format (static, could be class-level)
+        mp_to_coco_map = {
+            0: 0,  # nose
+            2: 1,  # left_eye
+            5: 2,  # right_eye
+            7: 3,  # left_ear
+            8: 4,  # right_ear
+            11: 5,  # left_shoulder
+            12: 6,  # right_shoulder
+            13: 7,  # left_elbow
+            14: 8,  # right_elbow
+            15: 9,  # left_wrist
+            16: 10,  # right_wrist
+            23: 11,  # left_hip
+            24: 12,  # right_hip
+            25: 13,  # left_knee
+            26: 14,  # right_knee
+            27: 15,  # left_ankle
+            28: 16,  # right_ankle
+        }
 
-            for mp_idx, coco_idx in mp_to_coco_map.items():
-                if mp_idx < len(landmarks):
-                    landmark = landmarks[mp_idx]
-                    # Convert normalized coordinates to pixel coordinates
-                    x = landmark.x * width
-                    y = landmark.y * height
-                    confidence = (
-                        landmark.visibility
-                    )  # MediaPipe uses visibility as confidence
+        keypoints = np.zeros(51, dtype=np.float32)  # 17 keypoints * 3
+        valid_points = []
 
-                    keypoints[coco_idx * 3] = x
-                    keypoints[coco_idx * 3 + 1] = y
-                    keypoints[coco_idx * 3 + 2] = confidence
+        for mp_idx, coco_idx in mp_to_coco_map.items():
+            if mp_idx < len(landmarks):
+                landmark = landmarks[mp_idx]
+                # Convert normalized coordinates to pixel coordinates
+                x = landmark.x * width
+                y = landmark.y * height
+                confidence = landmark.visibility
 
-            # Calculate bounding box from keypoints
-            valid_points = []
-            for i in range(17):
-                if (
-                    keypoints[i * 3 + 2] > self.min_detection_confidence
-                ):  # confidence threshold
-                    valid_points.append([keypoints[i * 3], keypoints[i * 3 + 1]])
+                base_idx = coco_idx * 3
+                keypoints[base_idx] = x
+                keypoints[base_idx + 1] = y
+                keypoints[base_idx + 2] = confidence
 
-            bbox = [0, 0, 0, 0]
-            if valid_points:
-                valid_points = np.array(valid_points)
-                x_min, y_min = np.min(valid_points, axis=0)
-                x_max, y_max = np.max(valid_points, axis=0)
-                bbox = [x_min, y_min, x_max - x_min, y_max - y_min]  # x, y, w, h
+                if confidence > self.min_detection_confidence:
+                    valid_points.append([x, y])
 
-            # Overall pose confidence (average of visible keypoints)
-            visible_keypoints = [kp for i, kp in enumerate(keypoints[2::3]) if kp > 0.3]
-            pose_confidence = np.mean(visible_keypoints) if visible_keypoints else 0.0
+        # Calculate bounding box from valid keypoints
+        bbox = np.array([0, 0, 0, 0], dtype=np.float32)
+        if valid_points:
+            valid_arr = np.array(valid_points, dtype=np.float32)
+            x_min, y_min = np.min(valid_arr, axis=0)
+            x_max, y_max = np.max(valid_arr, axis=0)
+            bbox = np.array(
+                [x_min, y_min, x_max - x_min, y_max - y_min], dtype=np.float32
+            )
 
-            # Format output: [person_id, confidence, keypoints(51), bbox(4)]
-            pose_output = np.zeros(57, dtype=np.float32)
-            pose_output[0] = 0  # person_id (MediaPipe only detects one person)
-            pose_output[1] = pose_confidence
-            pose_output[2:53] = keypoints
-            pose_output[53:57] = bbox
-            poses.append(pose_output)
+        # Overall pose confidence (average of visible keypoints)
+        conf_vals = keypoints[2::3]
+        visible_mask = conf_vals > 0.3
+        pose_confidence = (
+            float(np.mean(conf_vals[visible_mask])) if np.any(visible_mask) else 0.0
+        )
 
-        # Pad to fixed size (20 poses max)
-        result = np.zeros((20, 57), dtype=np.float32)
-        for i, pose in enumerate(poses[:20]):
-            result[i] = pose
+        # Use helper to create standardized output
+        result[0] = create_pose_output(0, pose_confidence, keypoints, bbox)
 
         return result

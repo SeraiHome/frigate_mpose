@@ -16,6 +16,12 @@ import torch
 from frigate.events.pose_types import PoseActionTypeEnum
 from frigate.pose_activity_detectors import register_detector
 from frigate.pose_activity_detectors.base import PoseActivityDetector
+from frigate.pose_detection.tensor_utils import (
+    COCO_NUM_KEYPOINTS,
+    KEYPOINT_DIMS,
+    KINETICS_NUM_KEYPOINTS,
+    ensure_keypoints_2d,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +242,8 @@ class STGCNFallDetector(PoseActivityDetector):
         """
         Convert keypoints to tensor format expected by STGCN model.
 
+        Optimized to minimize unnecessary copies and shape checks.
+
         Args:
             keypoints: NumPy array of shape (num_points, 3) where each row is [x, y, confidence]
             frame_width: Width of the frame in pixels, used for normalization
@@ -244,26 +252,31 @@ class STGCNFallDetector(PoseActivityDetector):
         Returns:
             torch.Tensor of shape (channels, 1, num_points, num_people)
         """
-        # Log the incoming keypoints for debugging
-        logger.debug(
-            f"Raw keypoints shape: {keypoints.shape}, non-zero coords: {np.count_nonzero(keypoints[:, :2])}"
-        )
-
         if not self.initialized:
             logger.warning("STGCN detector not initialized, returning zero tensor")
             return torch.zeros((self.channels, 1, self.num_points, self.num_people))
 
-        # Deep copy to avoid modifying original array
-        keypoints_copy = keypoints.copy()
+        # Use helper to ensure keypoints are in canonical 2D shape
+        keypoints_2d = ensure_keypoints_2d(keypoints, COCO_NUM_KEYPOINTS)
 
-        # Replace NaN values with zeros
-        if np.isnan(keypoints_copy).any():
-            logger.warning("NaN values found in keypoints, replacing with zeros")
-            keypoints_copy = np.nan_to_num(keypoints_copy)
+        # Log the incoming keypoints for debugging
+        logger.debug(
+            f"Raw keypoints shape: {keypoints_2d.shape}, non-zero coords: {np.count_nonzero(keypoints_2d[:, :2])}"
+        )
 
-        # Map COCO 17-keypoint format to the format expected by the STGCN model
-        # This handles the keypoint count mismatch seen in logs
-        if keypoints_copy.shape[0] == 17:
+        # Replace NaN values with zeros (in-place if already float32)
+        if keypoints_2d.dtype != np.float32:
+            keypoints_copy = keypoints_2d.astype(np.float32)
+        else:
+            keypoints_copy = keypoints_2d.copy()
+
+        np.nan_to_num(keypoints_copy, copy=False)
+
+        # Map COCO 17-keypoint format to Kinetics 18-keypoint format if needed
+        if (
+            keypoints_copy.shape[0] == COCO_NUM_KEYPOINTS
+            and self.num_points == KINETICS_NUM_KEYPOINTS
+        ):
             logger.debug(
                 f"Converting 17 COCO keypoints to {self.num_points} STGCN keypoints"
             )
@@ -276,7 +289,12 @@ class STGCNFallDetector(PoseActivityDetector):
             if keypoints_copy.shape[0] < self.num_points:
                 # Pad with zeros if we don't have enough points
                 pad_size = self.num_points - keypoints_copy.shape[0]
-                keypoints_copy = np.vstack([keypoints_copy, np.zeros((pad_size, 3))])
+                keypoints_copy = np.vstack(
+                    [
+                        keypoints_copy,
+                        np.zeros((pad_size, KEYPOINT_DIMS), dtype=np.float32),
+                    ]
+                )
             else:
                 # Truncate if we have too many points
                 keypoints_copy = keypoints_copy[: self.num_points]
@@ -463,46 +481,50 @@ class STGCNFallDetector(PoseActivityDetector):
             # Determine how many valid frames we have in the buffer
             available_frames = min(self.history_idx, int(self.window_size))
             # Only run inference once we have at least `effective_window_size` recent frames
-            if available_frames < int(
+            effective_window = int(
                 getattr(self, "effective_window_size", self.window_size)
-            ):
+            )
+            if available_frames < effective_window:
                 logger.debug(
-                    f"Not enough history yet for effective window: {available_frames}/{self.effective_window_size}"
+                    f"Not enough history yet for effective window: {available_frames}/{effective_window}"
                 )
                 return PoseActionTypeEnum.standing, 0.0
 
             try:
-                # Build an input list consisting of the last-K frames (K = effective_window_size)
+                # Build an input tensor from the last-K frames (K = effective_window_size)
                 poses_list = list(self.poses_history)
                 logger.debug(
                     f"History buffer length: {len(poses_list)}, available_frames: {available_frames}"
                 )
 
-                last_k = int(min(self.effective_window_size, available_frames))
-                # Tail: most recent last_k frames
-                tail = poses_list[-last_k:]
-
-                # Create zero padding tensors to pad up to the model's expected window_size
-                zero_tensor = (
-                    torch.zeros_like(poses_list[0])
-                    if len(poses_list) > 0
-                    else torch.zeros(
-                        (self.channels, 1, self.num_points, self.num_people)
-                    )
-                )
+                last_k = min(effective_window, available_frames)
                 pad_count = int(self.window_size) - last_k
-                padded_list = [zero_tensor] * pad_count + tail
 
-                # Stack and permute the tensor for model input
-                poses_tensor = torch.stack(padded_list, dim=0).permute(2, 1, 0, 3, 4)
+                # Optimized tensor construction: pre-allocate and fill
+                # Target shape: (1, channels, window_size, num_points, num_people)
+                poses_np = np.zeros(
+                    (
+                        1,
+                        self.channels,
+                        int(self.window_size),
+                        self.num_points,
+                        self.num_people,
+                    ),
+                    dtype=np.float32,
+                )
+
+                # Fill from the tail of poses_list into the end of the window
+                # Each pose tensor has shape (channels, 1, num_points, num_people)
+                for i, pose_tensor in enumerate(poses_list[-last_k:]):
+                    # Place at position pad_count + i (skip padding zone)
+                    poses_np[0, :, pad_count + i, :, :] = pose_tensor[
+                        :, 0, :, :
+                    ].numpy()
 
                 # Log tensor shape for debugging
                 logger.debug(
-                    f"Stacked pose tensor shape: {poses_tensor.shape} (last_k={last_k}, pad={pad_count})"
+                    f"Stacked pose tensor shape: {poses_np.shape} (last_k={last_k}, pad={pad_count})"
                 )
-
-                # Convert to numpy for TFLite with explicit dtype
-                poses_np = poses_tensor.numpy().astype(np.float32)
 
                 # Verify the numpy array has valid data
                 if np.count_nonzero(poses_np) == 0:

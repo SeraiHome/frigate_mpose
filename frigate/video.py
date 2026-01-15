@@ -797,9 +797,19 @@ def process_frames(
         regions = []
         consolidated_detections = []
 
+        # Check if pose detection is enabled for this camera
+        pose_enabled = (
+            hasattr(camera_config, "pose")
+            and camera_config.pose
+            and camera_config.pose.enabled
+        )
+
         # if detection is disabled
         if not camera_config.detect.enabled:
-            object_tracker.match_and_update(frame_name, frame_time, [])
+            # Don't update tracker yet if pose detection is enabled -
+            # we'll inject pose-based detections later
+            if not pose_enabled:
+                object_tracker.match_and_update(frame_name, frame_time, [])
         else:
             # get stationary object ids
             # check every Nth frame for stationary objects
@@ -1137,6 +1147,108 @@ def process_frames(
 
                     if publish_pose:
                         detections[pose_id] = det
+
+            # When object detection is disabled but pose detection found people,
+            # inject pose detections directly into the object tracker so they
+            # become tracked objects that can receive action sub-labels
+            if not camera_config.detect.enabled and pose_enabled and tracked_poses:
+                # Build pose detections from the tracked_poses list directly
+                # This ensures we process poses even if publish_to_detected_objects is false
+                pose_based_detections = []
+                pose_det_map = {}  # Map from box to full detection dict
+
+                for pose in tracked_poses:
+                    if not pose.bbox or len(pose.bbox) != 4:
+                        continue
+                    try:
+                        x, y, w, h = [int(v) for v in pose.bbox]
+                        box = (x, y, x + w, y + h)
+                    except Exception:
+                        continue
+
+                    width = max(1, box[2] - box[0])
+                    height = max(1, box[3] - box[1])
+                    area = width * height
+                    ratio = float(width) / float(height)
+                    region = (0, 0, int(frame_shape[0] * 3 // 2), int(frame_shape[1]))
+                    score = float(getattr(pose, "confidence", 0.0) or 0.0)
+
+                    pose_based_detections.append(
+                        ("person", score, box, area, ratio, region)
+                    )
+
+                    # Build full detection dict for later merging
+                    if hasattr(pose, "action"):
+                        a = pose.action
+                        action_label = a.value if hasattr(a, "value") else str(a)
+                    else:
+                        action_label = None
+
+                    pose_det_map[box] = {
+                        "id": f"pose_{pose.pose_id}",
+                        "label": "person",
+                        "sub_label": (
+                            action_label,
+                            float(
+                                getattr(
+                                    pose,
+                                    "action_confidence",
+                                    getattr(pose, "confidence", 0.0),
+                                )
+                                or 0.0
+                            ),
+                        )
+                        if action_label
+                        else None,
+                        "score": score,
+                        "box": list(box),
+                        "area": area,
+                        "ratio": ratio,
+                        "region": region,
+                        "frame_time": frame_time,
+                        "centroid": ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2),
+                        "estimate": box,
+                        "estimate_velocity": (0, 0),
+                        "start_time": frame_time,
+                        "motionless_count": 0,
+                        "position_changes": 0,
+                        "attributes": [],
+                        "score_history": [score],
+                    }
+
+                if pose_based_detections:
+                    logger.debug(
+                        f"{camera_config.name}: Injecting {len(pose_based_detections)} pose detections into tracker"
+                    )
+                    object_tracker.match_and_update(
+                        frame_name, frame_time, pose_based_detections
+                    )
+
+                    # After tracker processes poses, build detections dict from tracker
+                    # with pose-specific data (sub_label, action, etc.) preserved
+                    for obj in object_tracker.tracked_objects.values():
+                        obj_box = tuple(obj["box"])
+                        # Find matching pose detection by box proximity
+                        for pose_box, pose_det in pose_det_map.items():
+                            if obj_box == pose_box or (
+                                abs(obj_box[0] - pose_box[0]) < 10
+                                and abs(obj_box[1] - pose_box[1]) < 10
+                                and abs(obj_box[2] - pose_box[2]) < 10
+                                and abs(obj_box[3] - pose_box[3]) < 10
+                            ):
+                                # Merge tracker's ID/timing with pose data
+                                pose_det["id"] = obj["id"]
+                                pose_det["start_time"] = obj.get(
+                                    "start_time", frame_time
+                                )
+                                pose_det["motionless_count"] = obj.get(
+                                    "motionless_count", 0
+                                )
+                                pose_det["position_changes"] = obj.get(
+                                    "position_changes", 0
+                                )
+                                detections[obj["id"]] = pose_det
+                                break
 
             detected_objects_queue.put(
                 (
