@@ -40,7 +40,7 @@ export default function GeneralMetrics({
   const { data: initialStats } = useSWR<FrigateStats[]>(
     [
       "stats/history",
-      { keys: "cpu_usages,detectors,gpu_usages,npu_usages,processes,service" },
+      { keys: "cpu_usages,detectors,pose_detectors,gpu_usages,npu_usages,processes,service" },
     ],
     {
       revalidateOnFocus: false,
@@ -228,6 +228,187 @@ export default function GeneralMetrics({
     });
     return Object.values(series);
   }, [statsHistory]);
+
+  // pose detector stats
+
+  // Get accelerator labels for pose detectors (from most recent stats)
+  const poseDetectorAcceleratorLabels = useMemo(() => {
+    const labels: { [key: string]: string } = {};
+    if (!statsHistory || statsHistory.length === 0) return labels;
+
+    // Use the most recent stats to get accelerator info
+    const latestStats = statsHistory[statsHistory.length - 1];
+    if (!latestStats?.pose_detectors) return labels;
+
+    Object.entries(latestStats.pose_detectors).forEach(([key, detStats]) => {
+      const accelType = detStats.accelerator_type || "cpu";
+      const accelDevice = detStats.accelerator_device;
+      const modelType = detStats.model_type;
+
+      // Format label: "detector_name (accelerator_type)"
+      let label = `${key} (${accelType.toUpperCase()}`;
+      if (accelDevice) {
+        label += `:${accelDevice}`;
+      }
+      label += ")";
+      if (modelType) {
+        label += ` [${modelType}]`;
+      }
+      labels[key] = label;
+    });
+
+    return labels;
+  }, [statsHistory]);
+
+  const poseDetInferenceTimeSeries = useMemo(() => {
+    if (!statsHistory) {
+      return [];
+    }
+
+    const series: {
+      [key: string]: { name: string; data: { x: number; y: number }[] };
+    } = {};
+
+    statsHistory.forEach((stats, statsIdx) => {
+      if (!stats || !stats.pose_detectors) {
+        return;
+      }
+
+      Object.entries(stats.pose_detectors).forEach(([key, detStats]) => {
+        if (!(key in series)) {
+          // Use accelerator-aware label if available
+          const label = poseDetectorAcceleratorLabels[key] || key;
+          series[key] = { name: label, data: [] };
+        }
+
+        series[key].data.push({ x: statsIdx + 1, y: detStats.inference_speed });
+      });
+    });
+    return Object.values(series);
+  }, [statsHistory, poseDetectorAcceleratorLabels]);
+
+  const poseDetCpuSeries = useMemo(() => {
+    if (!statsHistory) {
+      return [];
+    }
+
+    const series: {
+      [key: string]: { name: string; data: { x: number; y: string }[] };
+    } = {};
+
+    statsHistory.forEach((stats, statsIdx) => {
+      if (!stats || !stats.pose_detectors) {
+        return;
+      }
+
+      Object.entries(stats.pose_detectors).forEach(([key, detStats]) => {
+        if (!(key in series)) {
+          // Use accelerator-aware label if available
+          const label = poseDetectorAcceleratorLabels[key] || key;
+          series[key] = { name: label, data: [] };
+        }
+
+        const data = stats.cpu_usages[detStats.pid?.toString()]?.cpu;
+
+        if (data != undefined) {
+          series[key].data.push({
+            x: statsIdx + 1,
+            y: data,
+          });
+        }
+      });
+    });
+    return Object.values(series);
+  }, [statsHistory, poseDetectorAcceleratorLabels]);
+
+  const poseDetMemSeries = useMemo(() => {
+    if (!statsHistory) {
+      return [];
+    }
+
+    const series: {
+      [key: string]: { name: string; data: { x: number; y: string }[] };
+    } = {};
+
+    statsHistory.forEach((stats, statsIdx) => {
+      if (!stats || !stats.pose_detectors) {
+        return;
+      }
+
+      Object.entries(stats.pose_detectors).forEach(([key, detStats]) => {
+        if (!(key in series)) {
+          // Use accelerator-aware label if available
+          const label = poseDetectorAcceleratorLabels[key] || key;
+          series[key] = { name: label, data: [] };
+        }
+
+        const data = stats.cpu_usages[detStats.pid?.toString()]?.mem;
+
+        if (data != undefined) {
+          series[key].data.push({
+            x: statsIdx + 1,
+            y: data,
+          });
+        }
+      });
+    });
+    return Object.values(series);
+  }, [statsHistory, poseDetectorAcceleratorLabels]);
+
+  // pose detector temperature series (for EdgeTPU/Coral accelerators)
+  const poseDetTempSeries = useMemo(() => {
+    if (!statsHistory) {
+      return undefined;
+    }
+
+    if (
+      statsHistory.length > 0 &&
+      Object.keys(statsHistory[0].service?.temperatures || {}).length === 0
+    ) {
+      return undefined;
+    }
+
+    const series: {
+      [key: string]: { name: string; data: { x: number; y: number }[] };
+    } = {};
+
+    statsHistory.forEach((stats, statsIdx) => {
+      if (!stats || !stats.pose_detectors) {
+        return;
+      }
+
+      // Find pose detectors using EdgeTPU
+      Object.entries(stats.pose_detectors).forEach(([key, detStats]) => {
+        const accelType = detStats.accelerator_type;
+        if (accelType !== "edgetpu") {
+          return;
+        }
+
+        // Match with temperature readings - EdgeTPU temps are in service.temperatures
+        const temperatures = stats.service?.temperatures || {};
+        const tempKeys = Object.keys(temperatures);
+
+        if (tempKeys.length > 0) {
+          if (!(key in series)) {
+            const label = poseDetectorAcceleratorLabels[key] || key;
+            series[key] = { name: label, data: [] };
+          }
+
+          // Use the first available temperature (or match by device if available)
+          const temp = Object.values(temperatures)[0];
+          if (temp !== undefined) {
+            series[key].data.push({ x: statsIdx + 1, y: Math.round(temp) });
+          }
+        }
+      });
+    });
+
+    if (Object.keys(series).length > 0) {
+      return Object.values(series);
+    }
+
+    return undefined;
+  }, [statsHistory, poseDetectorAcceleratorLabels]);
 
   // gpu stats
 
@@ -609,6 +790,103 @@ export default function GeneralMetrics({
             <Skeleton className="aspect-video w-full" />
           )}
         </div>
+
+        {/* Pose Detectors Section */}
+        {poseDetInferenceTimeSeries.length > 0 && (
+          <>
+            <div className="mt-4 text-sm font-medium text-muted-foreground">
+              {t("general.poseDetector.title", "Pose Detectors")}
+            </div>
+            <div
+              className={cn(
+                "mt-4 grid w-full grid-cols-1 gap-2 sm:grid-cols-3",
+                poseDetTempSeries && "md:grid-cols-4",
+              )}
+            >
+              {statsHistory.length != 0 ? (
+                <div className="rounded-lg bg-background_alt p-2.5 md:rounded-2xl">
+                  <div className="mb-5">
+                    {t("general.poseDetector.inferenceSpeed", "Inference Speed")}
+                  </div>
+                  {poseDetInferenceTimeSeries.map((series) => (
+                    <ThresholdBarGraph
+                      key={series.name}
+                      graphId={`${series.name}-pose-inference`}
+                      name={series.name}
+                      unit="ms"
+                      threshold={InferenceThreshold}
+                      updateTimes={updateTimes}
+                      data={[series]}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <Skeleton className="aspect-video w-full rounded-lg md:rounded-2xl" />
+              )}
+              {statsHistory.length != 0 && poseDetTempSeries && (
+                <div className="rounded-lg bg-background_alt p-2.5 md:rounded-2xl">
+                  <div className="mb-5">
+                    {t(
+                      "general.poseDetector.acceleratorTemperature",
+                      "Accelerator Temperature",
+                    )}
+                  </div>
+                  {poseDetTempSeries.map((series) => (
+                    <ThresholdBarGraph
+                      key={series.name}
+                      graphId={`${series.name}-pose-temp`}
+                      name={series.name}
+                      unit="°C"
+                      threshold={DetectorTempThreshold}
+                      updateTimes={updateTimes}
+                      data={[series]}
+                    />
+                  ))}
+                </div>
+              )}
+              {statsHistory.length != 0 && poseDetCpuSeries.length > 0 ? (
+                <div className="rounded-lg bg-background_alt p-2.5 md:rounded-2xl">
+                  <div className="mb-5">
+                    {t("general.poseDetector.cpuUsage", "CPU Usage")}
+                  </div>
+                  {poseDetCpuSeries.map((series) => (
+                    <ThresholdBarGraph
+                      key={series.name}
+                      graphId={`${series.name}-pose-cpu`}
+                      unit="%"
+                      name={series.name}
+                      threshold={DetectorCpuThreshold}
+                      updateTimes={updateTimes}
+                      data={[series]}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <Skeleton className="aspect-video w-full" />
+              )}
+              {statsHistory.length != 0 && poseDetMemSeries.length > 0 ? (
+                <div className="rounded-lg bg-background_alt p-2.5 md:rounded-2xl">
+                  <div className="mb-5">
+                    {t("general.poseDetector.memoryUsage", "Memory Usage")}
+                  </div>
+                  {poseDetMemSeries.map((series) => (
+                    <ThresholdBarGraph
+                      key={series.name}
+                      graphId={`${series.name}-pose-mem`}
+                      unit="%"
+                      name={series.name}
+                      threshold={DetectorMemThreshold}
+                      updateTimes={updateTimes}
+                      data={[series]}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <Skeleton className="aspect-video w-full" />
+              )}
+            </div>
+          </>
+        )}
 
         {(statsHistory.length == 0 ||
           gpuSeries.length > 0 ||

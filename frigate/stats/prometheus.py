@@ -246,6 +246,18 @@ class CustomCollector(object):
             labels=["name"],
         )
 
+        pose_detector_inference_speed = GaugeMetricFamily(
+            "frigate_pose_detector_inference_speed_seconds",
+            "Time spent running pose detection in seconds.",
+            labels=["name", "accelerator"],
+        )
+
+        pose_detector_detection_start = GaugeMetricFamily(
+            "frigate_pose_detection_start",
+            "Pose detector start time (unix timestamp)",
+            labels=["name", "accelerator"],
+        )
+
         try:
             for detector_name, detector_stats in stats["detectors"].items():
                 self.add_metric(
@@ -284,8 +296,32 @@ class CustomCollector(object):
         except KeyError:
             pass
 
+        # pose detector stats
+        try:
+            for detector_name, detector_stats in stats.get(
+                "pose_detectors", {}
+            ).items():
+                accelerator_type = detector_stats.get("accelerator_type", "cpu")
+                self.add_metric(
+                    pose_detector_inference_speed,
+                    [detector_name, accelerator_type],
+                    detector_stats,
+                    "inference_speed",
+                    0.001,
+                )  # ms to seconds
+                self.add_metric(
+                    pose_detector_detection_start,
+                    [detector_name, accelerator_type],
+                    detector_stats,
+                    "detection_start",
+                )
+        except KeyError:
+            pass
+
         yield detector_inference_speed
         yield detector_detection_start
+        yield pose_detector_inference_speed
+        yield pose_detector_detection_start
 
         # detector process stats
         try:
@@ -304,6 +340,25 @@ class CustomCollector(object):
                 except KeyError:
                     pass
 
+        except KeyError:
+            pass
+
+        # pose detector process stats
+        try:
+            for detector_name, detector_stats in stats.get(
+                "pose_detectors", {}
+            ).items():
+                p_pid = str(detector_stats["pid"])
+                label = [p_pid]  # pid label
+                try:
+                    label.append(detector_name)  # name label
+                    label.append(detector_name)  # process label
+                    label.append("pose_detectors")  # type label
+                    label.append(cpu_usages[p_pid]["cmdline"])  # cmdline label
+                    self.add_metric(cpu_usages_metric, label, cpu_usages[p_pid], "cpu")
+                    self.add_metric(mem_usages, label, cpu_usages[p_pid], "mem")
+                except KeyError:
+                    pass
         except KeyError:
             pass
 

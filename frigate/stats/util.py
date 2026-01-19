@@ -15,6 +15,7 @@ from frigate.config import FrigateConfig
 from frigate.const import CACHE_DIR, CLIPS_DIR, RECORD_DIR
 from frigate.data_processing.types import DataProcessorMetrics
 from frigate.object_detection.base import ObjectDetectProcess
+from frigate.pose_detection.base import PoseDetectProcess
 from frigate.types import StatsTrackingTypes
 from frigate.util.services import (
     calculate_shm_requirements,
@@ -57,12 +58,14 @@ def stats_init(
     camera_metrics: DictProxy,
     embeddings_metrics: DataProcessorMetrics | None,
     detectors: dict[str, ObjectDetectProcess],
+    pose_detectors: dict[str, PoseDetectProcess],
     processes: dict[str, int],
 ) -> StatsTrackingTypes:
     stats_tracking: StatsTrackingTypes = {
         "camera_metrics": camera_metrics,
         "embeddings_metrics": embeddings_metrics,
         "detectors": detectors,
+        "pose_detectors": pose_detectors,
         "started": int(time.time()),
         "latest_frigate_version": get_latest_version(config),
         "last_updated": int(time.time()),
@@ -299,6 +302,20 @@ def stats_snapshot(
             # from mypy 0.981 onwards
             "pid": pid,
         }
+
+    stats["pose_detectors"] = {}
+    for name, detector in stats_tracking["pose_detectors"].items():
+        pid = detector.detect_process.pid if detector.detect_process else None
+        stats["pose_detectors"][name] = {
+            "inference_speed": round(detector.avg_inference_speed.value * 1000, 2),  # type: ignore[attr-defined]
+            "detection_start": detector.detection_start.value,  # type: ignore[attr-defined]
+            "pid": pid,
+            # Accelerator info for monitoring
+            "accelerator_type": getattr(detector, "accelerator_type", "cpu"),
+            "accelerator_device": getattr(detector, "accelerator_device", None),
+            "model_type": getattr(detector, "model_type", None),
+        }
+
     stats["camera_fps"] = round(total_camera_fps, 2)
     stats["process_fps"] = round(total_process_fps, 2)
     stats["skipped_fps"] = round(total_skipped_fps, 2)

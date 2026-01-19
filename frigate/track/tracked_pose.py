@@ -59,9 +59,26 @@ class TrackedPose:
         self.entered_zones = set()
         self.current_zones = set()
 
+        # Zone presence tracking (for inertia and loitering time)
+        self.zone_presence: dict[str, int] = {}  # Frames present in zone
+        self.zone_loitering: dict[str, int] = {}  # Frames loitering in zone
+
         # History for smoothing and analysis
         self.keypoint_history = deque(maxlen=10)
         self.action_history = deque(maxlen=5)
+
+    def __getstate__(self):
+        """Exclude unpicklable objects (like TFLite interpreters) when pickling."""
+        state = self.__dict__.copy()
+        # Remove the activity detector - it contains TFLite interpreter which can't be pickled
+        state["_active_detector"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Restore state after unpickling."""
+        self.__dict__.update(state)
+        # _active_detector will be None after unpickling
+        # It needs to be re-assigned by the receiving process if needed
 
     @property
     def active_detector(self) -> Optional[PoseActivityDetector]:

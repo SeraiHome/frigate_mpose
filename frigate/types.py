@@ -4,12 +4,14 @@ from typing import TypedDict
 from frigate.camera import CameraMetrics
 from frigate.data_processing.types import DataProcessorMetrics
 from frigate.object_detection.base import ObjectDetectProcess
+from frigate.pose_detection.base import PoseDetectProcess
 
 
 class StatsTrackingTypes(TypedDict):
     camera_metrics: dict[str, CameraMetrics]
     embeddings_metrics: DataProcessorMetrics | None
     detectors: dict[str, ObjectDetectProcess]
+    pose_detectors: dict[str, PoseDetectProcess]
     started: int
     latest_frigate_version: str
     last_updated: int

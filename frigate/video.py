@@ -810,6 +810,31 @@ def process_frames(
             # we'll inject pose-based detections later
             if not pose_enabled:
                 object_tracker.match_and_update(frame_name, frame_time, [])
+            else:
+                # Generate tighter regions from motion for pose-only mode
+                # This provides visual feedback in the debug UI and helps
+                # with efficient pose detection (if use_motion_roi is enabled)
+                if motion_boxes and not motion_detector.is_calibrating():
+                    # Compute a tight bounding box around all motion with minimal padding
+                    # This is more aggressive than object detection regions
+                    min_x = min(b[0] for b in motion_boxes)
+                    min_y = min(b[1] for b in motion_boxes)
+                    max_x = max(b[2] for b in motion_boxes)
+                    max_y = max(b[3] for b in motion_boxes)
+
+                    # Add 10% padding for pose detection (people may extend beyond motion)
+                    width = max_x - min_x
+                    height = max_y - min_y
+                    pad_x = int(width * 0.1)
+                    pad_y = int(height * 0.1)
+
+                    region = (
+                        max(0, min_x - pad_x),
+                        max(0, min_y - pad_y),
+                        min(frame_shape[1], max_x + pad_x),
+                        min(frame_shape[0], max_y + pad_y),
+                    )
+                    regions = [region]
         else:
             # get stationary object ids
             # check every Nth frame for stationary objects
@@ -949,10 +974,13 @@ def process_frames(
                 if d[0] in attribute_labels
             ]
 
-        # build detections
+        # build detections from object tracker
+        # When object detection is disabled and pose detection is enabled,
+        # we'll populate detections later from pose processing instead.
         detections = {}
-        for obj in object_tracker.tracked_objects.values():
-            detections[obj["id"]] = {**obj, "attributes": []}
+        if camera_config.detect.enabled or not pose_enabled:
+            for obj in object_tracker.tracked_objects.values():
+                detections[obj["id"]] = {**obj, "attributes": []}
 
         # find the best object for each attribute to be assigned to
         all_objects: list[dict[str, Any]] = object_tracker.tracked_objects.values()
@@ -1054,99 +1082,65 @@ def process_frames(
                 tracked_poses = pose_integration.detect_poses(
                     frame, frame_time, motion_boxes, regions
                 )
-                for pose in tracked_poses:
-                    logger.info(f"Detected pose: {pose.pose_id} at {frame_time}")
-                    pose_id = f"pose_{pose.pose_id}"
 
-                    # Convert bbox from [x, y, w, h] format to [x1, y1, x2, y2]
-                    if not pose.bbox or len(pose.bbox) != 4:
-                        logger.debug(
-                            f"Invalid bbox for pose {pose.pose_id}: {pose.bbox}"
-                        )
-                        continue
+                if camera_config.detect.enabled:
+                    # Object detection is enabled - enrich existing person detections
+                    # with pose action data instead of creating separate detections.
+                    # Match poses to existing tracked objects by bounding box overlap.
+                    for pose in tracked_poses:
+                        if not pose.bbox or len(pose.bbox) != 4:
+                            continue
+                        try:
+                            px, py, pw, ph = [int(v) for v in pose.bbox]
+                            pose_box = (px, py, px + pw, py + ph)
+                        except Exception:
+                            continue
 
-                    try:
-                        x, y, w, h = [int(v) for v in pose.bbox]
-                        box = [x, y, x + w, y + h]  # Convert to [x1, y1, x2, y2]
-                    except Exception as e:
-                        logger.debug(
-                            f"Error converting bbox for pose {pose.pose_id}: {e}"
-                        )
-                        continue
+                        # Get action label
+                        if hasattr(pose, "action"):
+                            a = pose.action
+                            action_label = a.value if hasattr(a, "value") else str(a)
+                        else:
+                            action_label = None
 
-                    width = max(1, box[2] - box[0])
-                    height = max(1, box[3] - box[1])
-                    area = width * height
+                        # Find matching object detection by IoU
+                        best_match_id = None
+                        best_iou = 0.3  # Minimum IoU threshold
 
-                    # Build a detection dict compatible with TrackedObject / CameraState
-                    # Use a canonical main label (person) so object filters and
-                    # thresholds work. Store the pose action as a sub_label so
-                    # Frigate treats it like a verified/sub-label for the object.
-                    main_label = "person"
-                    # Normalize action to a plain string (enum -> value)
-                    if hasattr(pose, "action"):
-                        a = pose.action
-                        action_label = a.value if hasattr(a, "value") else str(a)
-                    else:
-                        action_label = None
+                        for obj_id, obj in detections.items():
+                            if obj.get("label") != "person":
+                                continue
+                            obj_box = obj.get("box", [])
+                            if len(obj_box) != 4:
+                                continue
 
-                    det = {
-                        "id": pose_id,
-                        "label": main_label,
-                        "sub_label": (
-                            action_label,
-                            float(
-                                getattr(
-                                    pose,
-                                    "action_confidence",
-                                    getattr(pose, "confidence", 0.0),
+                            # Calculate IoU
+                            x1 = max(pose_box[0], obj_box[0])
+                            y1 = max(pose_box[1], obj_box[1])
+                            x2 = min(pose_box[2], obj_box[2])
+                            y2 = min(pose_box[3], obj_box[3])
+
+                            if x2 > x1 and y2 > y1:
+                                intersection = (x2 - x1) * (y2 - y1)
+                                pose_area = (pose_box[2] - pose_box[0]) * (
+                                    pose_box[3] - pose_box[1]
                                 )
-                                or 0.0
-                            ),
-                        )
-                        if action_label
-                        else None,
-                        "score": float(getattr(pose, "confidence", 0.0) or 0.0),
-                        "box": box,
-                        "area": area,
-                        "ratio": float(width) / float(height),
-                        "region": (
-                            0,
-                            0,
-                            int(frame_shape[0] * 3 // 2),
-                            int(frame_shape[1]),
-                        ),
-                        # fields expected by TrackedObject / CameraState
-                        "frame_time": frame_time,
-                        "centroid": ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2),
-                        "estimate": tuple(box),
-                        "estimate_velocity": (0, 0),
-                        "start_time": frame_time,
-                        "motionless_count": 0,
-                        "position_changes": 0,
-                        "attributes": [],
-                        # score_history is required by TrackedObject.__init__
-                        "score_history": [
-                            float(getattr(pose, "confidence", 0.0) or 0.0)
-                        ],
-                    }
+                                obj_area = (obj_box[2] - obj_box[0]) * (
+                                    obj_box[3] - obj_box[1]
+                                )
+                                union = pose_area + obj_area - intersection
+                                iou = intersection / union if union > 0 else 0
 
-                    # Publish pose into the main detected_objects queue only
-                    # if configured to do so. Poses are still sent to the
-                    # `tracked_poses_queue` and processed by the dedicated
-                    # pose pipeline regardless of this flag.
-                    try:
-                        publish_pose = bool(
-                            getattr(camera_config, "pose", None)
-                            and getattr(
-                                camera_config.pose, "publish_to_detected_objects", True
+                                if iou > best_iou:
+                                    best_iou = iou
+                                    best_match_id = obj_id
+
+                        # Enrich the matched detection with pose action
+                        if best_match_id and action_label:
+                            detections[best_match_id]["sub_label"] = (
+                                action_label,
+                                float(getattr(pose, "action_confidence", 0.0) or 0.0),
                             )
-                        )
-                    except Exception:
-                        publish_pose = True
-
-                    if publish_pose:
-                        detections[pose_id] = det
 
             # When object detection is disabled but pose detection found people,
             # inject pose detections directly into the object tracker so they
@@ -1212,21 +1206,24 @@ def process_frames(
                         "start_time": frame_time,
                         "motionless_count": 0,
                         "position_changes": 0,
+                        "stationary": False,
                         "attributes": [],
                         "score_history": [score],
                     }
 
                 if pose_based_detections:
-                    logger.debug(
-                        f"{camera_config.name}: Injecting {len(pose_based_detections)} pose detections into tracker"
-                    )
                     object_tracker.match_and_update(
                         frame_name, frame_time, pose_based_detections
                     )
 
                     # After tracker processes poses, build detections dict from tracker
-                    # with pose-specific data (sub_label, action, etc.) preserved
+                    # with pose-specific data (sub_label, action, etc.) preserved.
+                    # Only include objects that were updated THIS frame to avoid duplicates.
                     for obj in object_tracker.tracked_objects.values():
+                        # Skip objects not updated this frame
+                        if obj.get("frame_time") != frame_time:
+                            continue
+
                         obj_box = tuple(obj["box"])
                         # Find matching pose detection by box proximity
                         for pose_box, pose_det in pose_det_map.items():

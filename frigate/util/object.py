@@ -98,8 +98,10 @@ def get_camera_regions_grid(
         x = box[0] + (box[2] / 2)
         y = box[1] + (box[3] / 2)
 
-        x_pos = int(x * GRID_SIZE)
-        y_pos = int(y * GRID_SIZE)
+        # Clamp to valid grid indices (0 to GRID_SIZE-1)
+        # When centroid is at edge (x=1.0), int(1.0*8)=8 which is out of bounds
+        x_pos = min(int(x * GRID_SIZE), GRID_SIZE - 1)
+        y_pos = min(int(y * GRID_SIZE), GRID_SIZE - 1)
 
         calculated_region = calculate_region(
             (height, width),
@@ -177,8 +179,9 @@ def get_region_from_grid(
         box[0] + (min(frame_shape[1], box[2]) - box[0]) / 2,
         box[1] + (min(frame_shape[0], box[3]) - box[1]) / 2,
     )
-    grid_x = int(centroid[0] / frame_shape[1] * GRID_SIZE)
-    grid_y = int(centroid[1] / frame_shape[0] * GRID_SIZE)
+    # Clamp to valid grid indices (0 to GRID_SIZE-1)
+    grid_x = min(int(centroid[0] / frame_shape[1] * GRID_SIZE), GRID_SIZE - 1)
+    grid_y = min(int(centroid[1] / frame_shape[0] * GRID_SIZE), GRID_SIZE - 1)
 
     cell = region_grid[grid_x][grid_y]
 

@@ -741,41 +741,152 @@ class TrackedPoseProcessor(threading.Thread):
         logger.info("Exiting pose processor...")
 
     def _update_pose_zones(self, camera: str, pose: TrackedPose) -> None:
-        """Update pose zone tracking."""
+        """Update pose zone tracking with inertia, loitering time, and zone filters.
+
+        This applies the same zone filtering logic as object detection, including:
+        - Object type filtering (zones can specify which objects/poses trigger them)
+        - Inertia (consecutive frames required before entering zone)
+        - Loitering time (seconds required to be considered in zone)
+        - Zone filters (min/max area, ratio, threshold)
+        """
         camera_config = self.config.cameras[camera]
 
-        # Check which zones the pose is currently in
-        current_zones = set()
+        if not hasattr(camera_config, "zones") or not pose.bbox:
+            return
 
-        if hasattr(camera_config, "zones") and pose.bbox:
-            # Use bottom center of bounding box for zone detection
-            x, y, w, h = pose.bbox
-            bottom_center = (
-                x + w / 2,
-                y + h,
-            )  # Bottom center is more reliable for zone detection
+        # Compute bottom center and area/ratio for filtering
+        x, y, w, h = pose.bbox
+        bottom_center = (
+            x + w / 2,
+            y + h,
+        )  # Bottom center is more reliable for zone detection
 
-            for zone_name, zone_config in camera_config.zones.items():
-                # Skip zones that don't include poses/persons
-                if hasattr(zone_config, "objects") and len(zone_config.objects) > 0:
-                    if (
-                        "person" not in zone_config.objects
-                        and "pose" not in zone_config.objects
-                    ):
-                        continue
+        pose_area = w * h
+        pose_ratio = w / h if h > 0 else 1.0
 
-                if hasattr(zone_config, "contour"):
-                    # Use the contour for zone detection
-                    if (
-                        cv2.pointPolygonTest(zone_config.contour, bottom_center, False)
-                        >= 0
-                    ):
-                        current_zones.add(zone_name)
+        current_zones = []
 
-        # Update pose zones
-        new_zones = current_zones - pose.current_zones
-        pose.entered_zones.update(new_zones)
-        pose.current_zones = current_zones
+        for zone_name, zone_config in camera_config.zones.items():
+            # Skip zones that don't include poses/persons
+            if hasattr(zone_config, "objects") and len(zone_config.objects) > 0:
+                if (
+                    "person" not in zone_config.objects
+                    and "pose" not in zone_config.objects
+                ):
+                    continue
+
+            if not hasattr(zone_config, "contour"):
+                continue
+
+            contour = zone_config.contour
+            zone_score = pose.zone_presence.get(zone_name, 0) + 1
+
+            # Check if the pose is inside the zone polygon
+            if cv2.pointPolygonTest(contour, bottom_center, False) >= 0:
+                # Apply zone filters if configured
+                if not self._pose_zone_filtered(
+                    pose, zone_config, pose_area, pose_ratio
+                ):
+                    # Update zone presence count
+                    pose.zone_presence[zone_name] = zone_score
+
+                    # Check inertia requirement
+                    inertia = getattr(zone_config, "inertia", 3)
+                    if zone_score >= inertia:
+                        # Update loitering count
+                        loitering_score = pose.zone_loitering.get(zone_name, 0) + 1
+                        pose.zone_loitering[zone_name] = loitering_score
+
+                        # Check loitering time requirement
+                        loitering_time = getattr(zone_config, "loitering_time", 0)
+                        detect_fps = camera_config.detect.fps
+
+                        # loitering_time is in seconds, convert to frames
+                        loitering_frames_required = loitering_time * detect_fps
+
+                        if loitering_score >= loitering_frames_required:
+                            current_zones.append(zone_name)
+
+                            if zone_name not in pose.entered_zones:
+                                pose.entered_zones.add(zone_name)
+                                logger.debug(
+                                    f"Pose {pose.pose_id} entered zone {zone_name}"
+                                )
+            else:
+                # Reset zone presence and loitering when pose leaves zone polygon
+                if zone_name in pose.zone_presence:
+                    del pose.zone_presence[zone_name]
+                if zone_name in pose.zone_loitering:
+                    del pose.zone_loitering[zone_name]
+
+        # Update current zones
+        pose.current_zones = set(current_zones)
+
+    def _pose_zone_filtered(
+        self, pose: TrackedPose, zone_config, pose_area: float, pose_ratio: float
+    ) -> bool:
+        """Check if pose should be filtered out based on zone filters.
+
+        Args:
+            pose: The TrackedPose to check
+            zone_config: Zone configuration with filters
+            pose_area: Computed area of the pose bounding box
+            pose_ratio: Computed width/height ratio of the pose bbox
+
+        Returns:
+            True if the pose should be filtered OUT (not included), False otherwise
+        """
+        # Check if there are person-specific filters in the zone
+        filters = getattr(zone_config, "filters", {})
+        if not filters:
+            return False
+
+        # Look for "person" or "pose" filters
+        obj_settings = filters.get("person") or filters.get("pose")
+        if not obj_settings:
+            return False
+
+        # Check min_area filter
+        min_area = getattr(obj_settings, "min_area", 0)
+        if min_area > 0 and pose_area < min_area:
+            logger.debug(
+                f"Pose {pose.pose_id} filtered: area {pose_area} < min_area {min_area}"
+            )
+            return True
+
+        # Check max_area filter
+        max_area = getattr(obj_settings, "max_area", float("inf"))
+        if max_area < float("inf") and pose_area > max_area:
+            logger.debug(
+                f"Pose {pose.pose_id} filtered: area {pose_area} > max_area {max_area}"
+            )
+            return True
+
+        # Check threshold (confidence) filter
+        threshold = getattr(obj_settings, "threshold", 0)
+        if threshold > 0 and pose.confidence < threshold:
+            logger.debug(
+                f"Pose {pose.pose_id} filtered: confidence {pose.confidence} < threshold {threshold}"
+            )
+            return True
+
+        # Check min_ratio filter
+        min_ratio = getattr(obj_settings, "min_ratio", 0)
+        if min_ratio > 0 and pose_ratio < min_ratio:
+            logger.debug(
+                f"Pose {pose.pose_id} filtered: ratio {pose_ratio} < min_ratio {min_ratio}"
+            )
+            return True
+
+        # Check max_ratio filter
+        max_ratio = getattr(obj_settings, "max_ratio", float("inf"))
+        if max_ratio < float("inf") and pose_ratio > max_ratio:
+            logger.debug(
+                f"Pose {pose.pose_id} filtered: ratio {pose_ratio} > max_ratio {max_ratio}"
+            )
+            return True
+
+        return False
 
     def _update_camera_activity(self, camera: str, poses: List[TrackedPose]) -> None:
         """Update camera activity based on pose detections."""

@@ -6,6 +6,9 @@ from multiprocessing.synchronize import Event as MpEvent
 import numpy as np
 
 from frigate.config import CameraConfig
+from frigate.pose_activity_detectors import create_activity_detector
+from frigate.pose_activity_detectors.base import PoseActivityDetector
+from frigate.pose_activity_detectors.detector_config import create_detector_config
 from frigate.pose_detection.base import RemotePoseDetector
 from frigate.pose_detection.tensor_utils import (
     COCO_NUM_KEYPOINTS,
@@ -45,10 +48,23 @@ class PoseDetectionIntegration:
         self.tracked_poses = {}
         self.next_pose_id = 0
         self.frame_count = 0
+        self._skip_counter = 0  # Frame skip counter
+
+        # Pre-compute skip interval for performance (avoid repeated config access)
+        self._skip_frames = getattr(self.pose_config, "skip_frames", 0)
+        self._use_motion_roi = getattr(self.pose_config, "use_motion_roi", False)
+
+        # Reusable buffer for RGB conversion (shared memory optimization)
+        self._rgb_buffer = None
+        self._rgb_buffer_shape = None
+
+        # Activity detector for pose action classification
+        self.activity_detector: PoseActivityDetector = None
 
         # Only initialize if pose detection is enabled for this camera
         if self.pose_config.enabled:
             self.initialize_detector()
+            self.initialize_activity_detector()
 
     def initialize_detector(self):
         """Initialize the pose detector for this camera."""
@@ -84,6 +100,55 @@ class PoseDetectionIntegration:
             )
             self.pose_detector = None
 
+    def initialize_activity_detector(self):
+        """Initialize the activity detector for pose action classification."""
+        try:
+            # Get activity detector config from pose config
+            if (
+                hasattr(self.pose_config, "activity_detector")
+                and self.pose_config.activity_detector
+            ):
+                config_dict = self.pose_config.activity_detector.model_dump()
+                logger.info(
+                    f"Initializing {config_dict.get('type', 'unknown')} activity detector for camera {self.camera_name}"
+                )
+            else:
+                # Default to heuristic detector
+                config_dict = {"type": "heuristic"}
+                logger.info(
+                    f"No activity detector configured for {self.camera_name}, using default heuristic detector"
+                )
+
+            # Create detector configuration
+            detector_config = create_detector_config(config_dict)
+            if detector_config is None:
+                logger.error(
+                    f"Failed to create detector configuration for camera {self.camera_name}"
+                )
+                return
+
+            # Create activity detector instance
+            self.activity_detector = create_activity_detector(detector_config)
+            if self.activity_detector and self.activity_detector.initialized:
+                logger.info(
+                    f"Successfully initialized activity detector for camera {self.camera_name}: {detector_config.type}"
+                )
+            else:
+                logger.warning(
+                    f"Activity detector initialization failed for {self.camera_name}, falling back to heuristic"
+                )
+                # Try heuristic as fallback
+                fallback_config = create_detector_config({"type": "heuristic"})
+                if fallback_config:
+                    self.activity_detector = create_activity_detector(fallback_config)
+        except Exception as e:
+            logger.error(
+                f"Error initializing activity detector for {self.camera_name}: {e}"
+            )
+            import traceback
+
+            logger.error(traceback.format_exc())
+
     def detect_poses(self, frame, frame_time, motion_boxes, regions):
         """Detect poses in the frame.
 
@@ -102,96 +167,112 @@ class PoseDetectionIntegration:
         # Note: We only require motion_boxes to have content. Regions may be
         # empty when object detection is disabled, which is fine.
         if not motion_boxes:
-            logger.debug(
-                f"Skipping pose detection for {self.camera_name}: no motion detected"
-            )
             return []
+
+        # Frame skip optimization: skip N frames between detections
+        if self._skip_frames > 0:
+            self._skip_counter += 1
+            if self._skip_counter <= self._skip_frames:
+                return []
+            self._skip_counter = 0
 
         detected_poses = []
         self.frame_count += 1
 
         try:
+            # Get FULL frame dimensions BEFORE cropping to ROI
+            # This is critical for consistent keypoint normalization in activity detection
+            if frame.ndim == 2:
+                # YUV I420 format - Y plane is 2/3 of total height
+                full_frame_height = int(frame.shape[0] * 2 / 3)
+                full_frame_width = frame.shape[1]
+            else:
+                full_frame_height, full_frame_width = frame.shape[:2]
+
+            # Compute motion ROI if enabled (union of all motion boxes with padding)
+            motion_roi = None
+            if self._use_motion_roi and motion_boxes:
+                motion_roi = self._compute_motion_roi(frame, motion_boxes)
+
             # Convert frame to RGB format required by pose detector and get
             # the region in the original frame that was used for the RGB crop.
-            rgb_frame, region = self._convert_frame_to_rgb(frame)
+            rgb_frame, region = self._convert_frame_to_rgb(frame, motion_roi)
 
             # Verify RGB frame has valid data before detection
-            if rgb_frame is not None and np.count_nonzero(rgb_frame) > 0:
-                # Create a fresh copy of the frame to ensure memory consistency
-                rgb_frame_copy = rgb_frame.copy()
-
-                # Extract frame dimensions for normalization from the actual RGB
-                # frame rather than relying on model config values which may
-                # not reflect the resized input used for detection.
-                frame_height, frame_width = rgb_frame_copy.shape[:2]
-                logger.debug(
-                    f"Frame dimensions for camera {self.camera_name}: {frame_width}x{frame_height}"
-                )
-
-                # Detect poses using the verified RGB frame
+            if rgb_frame is not None and rgb_frame.size > 0 and np.any(rgb_frame):
+                # Detect poses using the RGB frame (no copy needed - detector handles internally)
                 detected_poses = self.pose_detector.detect(
-                    rgb_frame_copy, self.pose_config.confidence_threshold
+                    rgb_frame, self.pose_config.confidence_threshold
                 )
 
-                # Map returned bboxes from detector/model input coordinates
-                # back to the original frame coordinates. The detector typically
-                # resizes rgb_frame_copy to the model input size internally; we
-                # therefore scale using the rgb_frame dimensions and add the
-                # region offset to place the bbox in the original frame.
-                try:
-                    model_w = getattr(
-                        self.model_config, "width", rgb_frame_copy.shape[1]
-                    )
-                    model_h = getattr(
-                        self.model_config, "height", rgb_frame_copy.shape[0]
-                    )
-                except Exception:
-                    model_h, model_w = rgb_frame_copy.shape[:2]
+                # Map returned bboxes AND keypoints from detector output coordinates
+                # back to the FULL FRAME coordinates.
+                #
+                # With dynamic SHM, the detector receives the rgb_frame at its ACTUAL size
+                # (not resized to model config dimensions). MediaPipe returns coordinates
+                # scaled to the input image dimensions, so we use rgb_frame.shape for mapping.
+                #
+                # The mapping is: detector coords (rgb_frame space) → full frame coords
+                rgb_h, rgb_w = rgb_frame.shape[:2]
 
                 # region is in original frame coords (x_min,y_min,x_max,y_max)
                 if region is None:
                     # If no region was used, treat the whole rgb_frame as region
-                    region = (0, 0, rgb_frame_copy.shape[1], rgb_frame_copy.shape[0])
+                    region = (0, 0, rgb_w, rgb_h)
 
                 region_x0, region_y0, region_x1, region_y1 = region
                 region_w = max(1, region_x1 - region_x0)
                 region_h = max(1, region_y1 - region_y0)
 
-                # detector returns bbox as [x, y, w, h] in model pixels
+                # Scale factors from rgb_frame coords to region coords in full frame
+                # The detector outputs coords in rgb_frame space (0 to rgb_w/rgb_h)
+                # We need to map these to the region in the full frame
+                scale_x = region_w / rgb_w
+                scale_y = region_h / rgb_h
+
+                # Map bbox AND keypoints for each detected pose to full-frame coordinates
                 for p in detected_poses:
+                    # Map bbox from model pixels → region pixels → full-frame
                     bbox = p.get("bbox")
-                    if bbox is None or len(bbox) != 4:
-                        continue
-                    try:
-                        bx, by, bw, bh = bbox
-                        # scale from model pixels to region pixels
-                        x_reg = float(bx) * (region_w / model_w)
-                        y_reg = float(by) * (region_h / model_h)
-                        w_reg = float(bw) * (region_w / model_w)
-                        h_reg = float(bh) * (region_h / model_h)
+                    if bbox is not None and len(bbox) == 4:
+                        try:
+                            bx, by, bw, bh = bbox
+                            # scale from model pixels to region pixels, then to full frame
+                            x_full = int(region_x0 + float(bx) * scale_x)
+                            y_full = int(region_y0 + float(by) * scale_y)
+                            w_full = int(max(1, float(bw) * scale_x))
+                            h_full = int(max(1, float(bh) * scale_y))
+                            p["bbox"] = [x_full, y_full, w_full, h_full]
+                        except Exception:
+                            pass  # leave bbox as-is on failure
 
-                        # map to original frame coordinates by adding region offset
-                        x_full = int(region_x0 + x_reg)
-                        y_full = int(region_y0 + y_reg)
-                        w_full = int(max(1, w_reg))
-                        h_full = int(max(1, h_reg))
-
-                        # replace bbox in-place with original-frame [x,y,w,h]
-                        p["bbox"] = [x_full, y_full, w_full, h_full]
-                    except Exception:
-                        # leave bbox as-is on failure
-                        continue
+                    # Map keypoints from model pixels → region pixels → full-frame
+                    # This ensures STGCN normalization is consistent regardless of ROI size
+                    keypoints = p.get("keypoints")
+                    if keypoints is not None:
+                        try:
+                            kp = np.array(keypoints, dtype=np.float32)
+                            if kp.ndim == 1:
+                                # Flat array: [x0, y0, conf0, x1, y1, conf1, ...]
+                                for i in range(0, len(kp), 3):
+                                    if i + 1 < len(kp):
+                                        # Transform x, y to full-frame coords
+                                        kp[i] = region_x0 + kp[i] * scale_x
+                                        kp[i + 1] = region_y0 + kp[i + 1] * scale_y
+                            elif kp.ndim == 2:
+                                # 2D array: (num_keypoints, 3) with [x, y, conf]
+                                kp[:, 0] = region_x0 + kp[:, 0] * scale_x
+                                kp[:, 1] = region_y0 + kp[:, 1] * scale_y
+                            p["keypoints"] = kp
+                        except Exception:
+                            pass  # leave keypoints as-is on failure
             else:
-                logger.error(
-                    f"RGB frame is empty or all zeros - cannot detect poses for camera {self.camera_name}"
-                )
                 detected_poses = []
-                frame_width = None
-                frame_height = None
 
-            # Track and process poses
+            # Track and process poses using FULL FRAME dimensions for consistent
+            # STGCN normalization regardless of ROI size changes between frames
             tracked_poses = self.track_poses(
-                detected_poses, frame_time, frame_width, frame_height
+                detected_poses, frame_time, full_frame_width, full_frame_height
             )
 
             # Send tracked poses to the queue for further processing
@@ -218,19 +299,70 @@ class PoseDetectionIntegration:
             logger.error(traceback.format_exc())
             return []
 
-    def _convert_frame_to_rgb(self, frame):
+    def _compute_motion_roi(self, frame, motion_boxes):
+        """Compute bounding region containing all motion boxes with padding.
+
+        Returns (x_min, y_min, x_max, y_max) in original frame coordinates,
+        or None if motion_boxes is empty.
+        """
+        if not motion_boxes:
+            return None
+
+        # Get frame dimensions
+        if frame.ndim == 2:
+            # YUV I420 format - Y plane is 2/3 of total height
+            frame_height = int(frame.shape[0] * 2 / 3)
+            frame_width = frame.shape[1]
+        else:
+            frame_height, frame_width = frame.shape[:2]
+
+        # Compute union of all motion boxes
+        # motion_boxes format: list of (x, y, w, h)
+        x_min = frame_width
+        y_min = frame_height
+        x_max = 0
+        y_max = 0
+
+        for box in motion_boxes:
+            if len(box) >= 4:
+                bx, by, bw, bh = box[:4]
+                x_min = min(x_min, bx)
+                y_min = min(y_min, by)
+                x_max = max(x_max, bx + bw)
+                y_max = max(y_max, by + bh)
+
+        if x_max <= x_min or y_max <= y_min:
+            return None
+
+        # Add 20% padding to capture full pose even if only part is in motion
+        pad_w = int((x_max - x_min) * 0.2)
+        pad_h = int((y_max - y_min) * 0.2)
+
+        # Ensure minimum padding of 50 pixels
+        pad_w = max(pad_w, 50)
+        pad_h = max(pad_h, 50)
+
+        x_min = max(0, x_min - pad_w)
+        y_min = max(0, y_min - pad_h)
+        x_max = min(frame_width, x_max + pad_w)
+        y_max = min(frame_height, y_max + pad_h)
+
+        return (x_min, y_min, x_max, y_max)
+
+    def _convert_frame_to_rgb(self, frame, motion_roi=None):
         """Convert input frame to RGB format needed by pose detector.
 
         Returns a tuple: (rgb_frame, region). `region` is the (x_min,y_min,x_max,y_max)
         rectangle in the original frame that was used to produce `rgb_frame`.
         If no explicit region was used, `region` will cover the full frame.
 
-        Optimized to minimize redundant shape checks.
+        Args:
+            frame: Input frame (YUV or RGB)
+            motion_roi: Optional (x_min, y_min, x_max, y_max) to crop to motion region
+
+        Optimized to minimize redundant shape checks and memory allocations.
         """
         try:
-            # Log frame shape for debugging
-            logger.debug(f"frame.shape: {frame.shape}")
-
             frame_ndim = frame.ndim
 
             # Already in RGB format (3D with appropriate dimensions)
@@ -240,9 +372,19 @@ class PoseDetectionIntegration:
                 and frame.shape[0] <= frame.shape[1] * 1.2
             ):
                 h, w = frame.shape[:2]
+                # Apply motion ROI if provided for RGB frames
+                if motion_roi is not None:
+                    x0, y0, x1, y1 = motion_roi
+                    x0 = max(0, min(x0, w - 1))
+                    y0 = max(0, min(y0, h - 1))
+                    x1 = max(x0 + 1, min(x1, w))
+                    y1 = max(y0 + 1, min(y1, h))
+                    return frame[y0:y1, x0:x1], (x0, y0, x1, y1)
                 return frame, (0, 0, w, h)
 
-            # Handle YUV conversion - create square regions to avoid dimension mismatch
+            # Handle YUV conversion
+            # Note: yuv_region_2_rgb uses yuv_crop_and_resize which forces square output
+            # based on region height. We must ensure the region is square to avoid errors.
             if is_yuv_frame(frame):
                 if frame_ndim == 2:
                     # For I420 format, Y plane height is 2/3 of the total height
@@ -253,35 +395,54 @@ class PoseDetectionIntegration:
                     y_height = frame.shape[0]
                     frame_width = frame.shape[1]
 
-                # Calculate dimensions for a square region
-                square_size = min(frame_width, y_height)
+                # Use motion ROI if provided, otherwise use largest centered square
+                if motion_roi is not None:
+                    # Clamp motion_roi to valid frame bounds
+                    x0, y0, x1, y1 = motion_roi
+                    x0 = max(0, min(x0, frame_width - 1))
+                    y0 = max(0, min(y0, y_height - 1))
+                    x1 = max(x0 + 1, min(x1, frame_width))
+                    y1 = max(y0 + 1, min(y1, y_height))
 
-                # Center the square region
-                x_center = frame_width // 2
-                y_center = y_height // 2
-
-                # Create square region centered in the frame
-                half_size = square_size // 2
-                region = (
-                    max(0, x_center - half_size),
-                    max(0, y_center - half_size),
-                    min(frame_width, x_center + half_size),
-                    min(y_height, y_center + half_size),
-                )
-
-                # Ensure square dimensions
-                region_width = region[2] - region[0]
-                region_height = region[3] - region[1]
-                if region_width != region_height:
-                    new_size = min(region_width, region_height)
+                    # Make the region square (yuv_crop_and_resize requires it)
+                    roi_w = x1 - x0
+                    roi_h = y1 - y0
+                    if roi_w != roi_h:
+                        # Use the smaller dimension to ensure we stay in bounds
+                        size = min(roi_w, roi_h)
+                        # Round down to multiple of 4 for YUV alignment
+                        size = (size // 4) * 4
+                        if size < 4:
+                            size = 4
+                        cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+                        half = size // 2
+                        x0 = max(0, cx - half)
+                        y0 = max(0, cy - half)
+                        x1 = x0 + size
+                        y1 = y0 + size
+                        # If we exceed bounds, shift the region back
+                        if x1 > frame_width:
+                            x1 = frame_width
+                            x0 = x1 - size
+                        if y1 > y_height:
+                            y1 = y_height
+                            y0 = y1 - size
+                    region = (x0, y0, x1, y1)
+                else:
+                    # Create largest centered square region
+                    square_size = min(frame_width, y_height)
+                    # Round down to multiple of 4 for YUV alignment
+                    square_size = (square_size // 4) * 4
+                    x_center = frame_width // 2
+                    y_center = y_height // 2
+                    half_size = square_size // 2
                     region = (
-                        region[0],
-                        region[1],
-                        region[0] + new_size,
-                        region[1] + new_size,
+                        max(0, x_center - half_size),
+                        max(0, y_center - half_size),
+                        max(0, x_center - half_size) + square_size,
+                        max(0, y_center - half_size) + square_size,
                     )
 
-                logger.debug(f"region: {region}")
                 return yuv_region_2_rgb(frame, region), region
 
             # If we can't determine the format, return as is
@@ -478,9 +639,6 @@ class PoseDetectionIntegration:
 
             if matched_pose:
                 pose_id = matched_id
-                logger.debug(
-                    f"Matched detection to existing pose ID: {pose_id} for camera: {self.camera_name}"
-                )
                 # Update existing tracked pose
                 tracked_pose = matched_pose
                 tracked_pose.frame_time = frame_time
@@ -520,7 +678,14 @@ class PoseDetectionIntegration:
                 confidence=pose.get("confidence", 0.0),
                 bbox=bbox_param,
                 frame_time=frame_time,
+                camera_name=self.camera_name,
+                frame_width=frame_width,
+                frame_height=frame_height,
             )
+
+            # Assign the activity detector for pose action analysis
+            if self.activity_detector and self.activity_detector.initialized:
+                tracked_pose.active_detector = self.activity_detector
 
             # Mark as not a false positive since it just got detected
             tracked_pose.false_positive = False

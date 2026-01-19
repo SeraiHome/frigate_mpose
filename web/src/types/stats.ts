@@ -2,6 +2,7 @@ export interface FrigateStats {
   cameras: { [camera_name: string]: CameraStats };
   cpu_usages: { [pid: string]: CpuStats };
   detectors: { [detectorKey: string]: DetectorStats };
+  pose_detectors?: { [detectorKey: string]: PoseDetectorStats };
   embeddings?: EmbeddingsStats;
   gpu_usages?: { [gpuKey: string]: GpuStats };
   npu_usages?: { [npuKey: string]: NpuStats };
@@ -38,6 +39,27 @@ export type DetectorStats = {
   inference_speed: number;
   pid: number;
 };
+
+export type PoseDetectorStats = {
+  detection_start: number;
+  inference_speed: number;
+  pid: number;
+  accelerator_type: AcceleratorType;
+  accelerator_device?: string | null;
+  model_type?: string | null;
+};
+
+// Supported accelerator types for pose detectors
+export type AcceleratorType =
+  | "cpu"
+  | "edgetpu"
+  | "gpu"
+  | "tensorrt"
+  | "memryx"
+  | "hailo"
+  | "rockchip"
+  | "rocm"
+  | "openvino";
 
 export type EmbeddingsStats = {
   image_embedding_speed: number;

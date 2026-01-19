@@ -412,26 +412,25 @@ class FrigateApp:
             self.pose_detection_queues[camera_name] = mp.Queue()
 
             try:
-                # Calculate the largest pose frame size, defaulting to 320 if no detectors
-                # RemotePoseDetector creates a 4D array with shape (1, height, width, 3)
-                # The exact buffer size calculation is tricky due to memory alignment and overhead
-                # So we use a generous multiplier to ensure there's always enough space
-                # Calculate a guaranteed large enough buffer for pose detection
-                # We need to ensure it can handle any reasonable image size
-                # 640x480 RGB = 921,600 bytes
-                # Add extra buffer for alignment and use a minimum of 10MB
-                # Using 10MB (10,485,760 bytes) to be safe
-                largest_pose_frame = 10485760  # 10MB
+                # Import the dynamic SHM format helper
+                from frigate.pose_detection.shm_format import calculate_shm_buffer_size
+
+                # Size SHM buffer based on camera's detect dimensions (not global max)
+                # This significantly reduces memory for lower-resolution cameras
+                camera_config = self.config.cameras[camera_name]
+                detect_width = camera_config.detect.width
+                detect_height = camera_config.detect.height
+
+                # Calculate buffer size for this camera's frame dimensions
+                buffer_size = calculate_shm_buffer_size(detect_width, detect_height)
+
                 logger.info(
-                    "Setting pose detection buffer size to 10MB for all cameras"
-                )
-                logger.info(
-                    f"Allocating pose detection buffer of size: {largest_pose_frame} bytes for camera {camera_name}"
+                    f"Allocating pose SHM for {camera_name}: {detect_width}x{detect_height} = {buffer_size:,} bytes"
                 )
                 shm_in = UntrackedSharedMemory(
                     name=f"pose-{camera_name}",
                     create=True,
-                    size=largest_pose_frame,
+                    size=buffer_size,
                 )
             except FileExistsError:
                 shm_in = UntrackedSharedMemory(name=f"pose-{camera_name}")
@@ -591,6 +590,7 @@ class FrigateApp:
                 self.camera_metrics,
                 self.embeddings_metrics,
                 self.detectors,
+                self.pose_detectors,
                 self.processes,
             ),
             self.stop_event,

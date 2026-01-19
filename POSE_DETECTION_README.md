@@ -132,18 +132,128 @@ MAX_POSES = 20
 3. **YUV Detection**: Centralized logic eliminates 6+ duplicate implementations
 4. **MediaPipe Postprocessing**: Combined bbox calculation with keypoint extraction loop
 5. **Class-level Constants**: Moved mapping dictionaries outside methods
+6. **Frame Copy Elimination**: Removed unnecessary `rgb_frame.copy()` before detection
+7. **Shared Memory Buffer Reuse**: Uses `np.copyto()` for direct buffer writes instead of intermediate copies
+8. **Debug Logging Reduction**: Removed verbose debug logging in hot paths
+
+---
+
+## Runtime Performance Tuning
+
+### Frame Skipping (`skip_frames`)
+
+Skip N frames between pose detections to reduce CPU/GPU load:
+
+```yaml
+pose:
+  skip_frames: 2 # Process every 3rd frame (2 skipped + 1 processed)
+```
+
+| Setting          | Effective FPS (at 30fps input) | Use Case                    |
+| ---------------- | ------------------------------ | --------------------------- |
+| `skip_frames: 0` | 30 fps                         | Real-time activity tracking |
+| `skip_frames: 1` | 15 fps                         | Balanced performance        |
+| `skip_frames: 2` | 10 fps                         | Low-power devices           |
+| `skip_frames: 4` | 6 fps                          | Very constrained hardware   |
+
+**Note**: Higher skip values may miss fast activities (falls happen in ~0.5-1s). For fall detection, `skip_frames: 1` or `2` is recommended.
+
+### Motion ROI Cropping (`use_motion_roi`)
+
+Only process the region containing detected motion, reducing inference area:
+
+```yaml
+pose:
+  use_motion_roi: true # Crop to motion bounding box before detection
+```
+
+**Benefits**:
+
+- **2-5x speedup** on large frames where motion is localized
+- Reduces GPU memory bandwidth
+- Particularly effective for high-resolution cameras
+
+**Caveats**:
+
+- May miss poses at frame edges if they're outside the motion region
+- Adds 10% padding around motion region to capture full poses
+
+**When to use**:
+
+- High-resolution cameras (1080p+) with mostly static scenes
+- Localized activity monitoring (e.g., doorway, specific area)
+- Resource-constrained hardware
+
+**When to avoid**:
+
+- Full-frame activity monitoring
+- Very active scenes with motion everywhere
+
+### Dynamic Shared Memory (No Resize)
+
+The pose detection pipeline uses **dynamic shared memory** that eliminates the need to resize frames to a fixed model input size. This provides significant performance benefits:
+
+```
+BEFORE (Fixed 320×320 SHM):
+┌─────────────────┐     ┌──────────────┐     ┌───────────────┐
+│ ROI Crop        │ --> │ cv2.resize   │ --> │ Fixed 320×320 │ --> MediaPipe
+│ (e.g., 200×200) │     │ to 320×320   │     │ SHM buffer    │
+└─────────────────┘     └──────────────┘     └───────────────┘
+
+AFTER (Dynamic SHM):
+┌─────────────────┐     ┌──────────────────────────────┐
+│ ROI Crop        │ --> │ Dynamic SHM (header + data)  │ --> MediaPipe
+│ (e.g., 200×200) │     │ [16B header][200×200×3 data] │     (any size)
+└─────────────────┘     └──────────────────────────────┘
+```
+
+**Benefits**:
+
+- **No cv2.resize()** - eliminates resize computation entirely
+- **Better quality** - no interpolation artifacts from upscaling small ROIs
+- **Memory efficient** - buffer sized per-camera, not global max
+- **MediaPipe handles variable sizes natively** - internal resize is optimized
 
 ---
 
 ## Shared Memory Layout
 
+Pose detection uses dynamic shared memory with a header-based format that allows variable-size frames without resizing. This eliminates the computational overhead of resizing and preserves frame quality.
+
+### Dynamic SHM Format
+
+```
+┌────────────────────────────────────────────────────────┐
+│ Header (16 bytes): 4 x int32                           │
+│   [0] width  - actual frame width in pixels            │
+│   [1] height - actual frame height in pixels           │
+│   [2] stride - row stride in bytes (width * 3 for RGB) │
+│   [3] flags  - reserved for future use                 │
+├────────────────────────────────────────────────────────┤
+│ Pixel data (up to max_width × max_height × 3 bytes)    │
+│   RGB format, row-major order                          │
+└────────────────────────────────────────────────────────┘
+```
+
+### Per-Camera Buffer Sizing
+
+The SHM buffer is sized **per-camera based on the camera's detect dimensions**, not a global maximum. This significantly reduces memory usage:
+
+| Camera Detect Size | Buffer Size | vs 1080p Max    |
+| ------------------ | ----------- | --------------- |
+| 640×480            | ~922 KB     | **85% smaller** |
+| 1280×720           | ~2.8 MB     | **55% smaller** |
+| 1920×1080          | ~6.2 MB     | baseline        |
+
+**Example**: A system with 4 cameras at 640×480 uses ~3.7 MB total instead of ~24.8 MB.
+
 ### Input Buffer: `pose-<camera_name>`
 
-- **Size**: 10MB (configurable, safe for typical resized inputs)
-- **Format**: `(1, height, width, 3)` NHWC uint8 RGB
+- **Size**: `16 + (detect_width × detect_height × 3)` bytes per camera
+- **Format**: Header (16 bytes) + RGB pixel data (variable size)
 - **Created by**: `app.py:start_pose_detectors()`
-- **Written by**: Camera frame producer
-- **Read by**: `RemotePoseDetector`
+- **Written by**: `RemotePoseDetector.detect()` via `write_frame_to_shm()`
+- **Read by**: `PoseDetectorRunner` via `read_frame_from_shm()`
 
 ### Output Buffer: `pose-out-<camera_name>`
 
@@ -239,7 +349,8 @@ cameras:
       enabled: true # Enable pose detection
       confidence_threshold: 0.4 # Min detection confidence
       keypoint_threshold: 0.3 # Min keypoint confidence
-      fps: 5 # Pose detection FPS (max 30)
+      skip_frames: 0 # Skip N frames between detections (0 = process every frame)
+      use_motion_roi: false # Crop to motion region before pose detection
       publish_to_detected_objects: true # Recommended; controls pose visibility when detect.enabled: true
       mask: "" # Detection mask (polygon)
       required_zones: [] # Zones required for events

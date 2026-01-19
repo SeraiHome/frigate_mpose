@@ -77,8 +77,24 @@ class PoseConfig(FrigateBaseModel):
         default_factory=list,
         title="List of required zones for pose detection to trigger events.",
     )
-    fps: int = Field(
-        default=5, title="FPS for pose detection (should be <= camera detect fps)."
+    skip_frames: int = Field(
+        default=0,
+        title="Number of frames to skip between pose detections.",
+        description=(
+            "Set to 0 to process every frame (respecting fps limit). "
+            "Set to N to skip N frames between detections for better performance. "
+            "Example: skip_frames=2 processes every 3rd frame."
+        ),
+    )
+    use_motion_roi: bool = Field(
+        default=False,
+        title="Use motion region of interest for pose detection.",
+        description=(
+            "When enabled, pose detection will only run on the cropped region "
+            "containing detected motion, significantly reducing processing time. "
+            "Disable if your model doesn't support variable input sizes or if "
+            "poses are being missed near frame edges."
+        ),
     )
     publish_to_detected_objects: bool = Field(
         default=True,
@@ -90,10 +106,3 @@ class PoseConfig(FrigateBaseModel):
             "processing pipeline instead."
         ),
     )
-
-    def __init__(self, **config):
-        super().__init__(**config)
-
-        # Ensure pose detection fps doesn't exceed reasonable limits
-        if self.fps > 30:
-            self.fps = 30

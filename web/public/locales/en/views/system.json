@@ -45,6 +45,13 @@
       "cpuUsageInformation": "CPU used in preparing input and output data to/from detection models. This value does not measure inference usage, even if using a GPU or accelerator.",
       "memoryUsage": "Detector Memory Usage"
     },
+    "poseDetector": {
+      "title": "Pose Detectors",
+      "inferenceSpeed": "Pose Inference Speed",
+      "acceleratorTemperature": "Accelerator Temperature",
+      "cpuUsage": "Pose Detector CPU Usage",
+      "memoryUsage": "Pose Detector Memory Usage"
+    },
     "hardwareInfo": {
       "title": "Hardware Info",
       "gpuUsage": "GPU Usage",
