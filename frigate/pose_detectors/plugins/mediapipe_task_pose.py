@@ -301,7 +301,7 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
 
             # Save visualization if landmarks are detected and debug dir exists
             debug_dir = os.path.join(const.BASE_DIR, "debug")
-            if False:  # results.pose_landmarks and os.path.exists(debug_dir):
+            if True:  # results.pose_landmarks and os.path.exists(debug_dir):
                 try:
                     # Create a copy of the RGB image for visualization
                     vis_image = image_rgb.copy()

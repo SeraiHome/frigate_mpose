@@ -55,7 +55,7 @@ frigate/
 │   ├── integration.py        # Per-camera pose detection integration
 │   ├── tensor_utils.py       # Centralized tensor constants and helpers (NEW)
 │   ├── util.py               # Pose utilities (bbox, similarity, formatting)
-│   └── fall_processor/       # Fall-specific processing and models
+│   └── fall_processor/       # Storage of local models and weights
 │
 ├── pose_detectors/           # Pose detector implementations
 │   ├── detector_config.py    # BasePoseDetectorConfig, PoseModelConfig

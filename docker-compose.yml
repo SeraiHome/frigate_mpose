@@ -40,4 +40,4 @@ services:
     image: eclipse-mosquitto:2.0
     command: mosquitto -c /mosquitto-no-auth.conf # enable no-auth mode
     ports:
-      - "1883:1883"
+      - "1893:1883" #offset to avoid conflict with host mqtt broker

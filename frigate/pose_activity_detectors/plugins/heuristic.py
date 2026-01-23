@@ -56,12 +56,15 @@ class HeuristicPoseDetector(PoseActivityDetector):
         """Reset the detector's internal state."""
         self.action_history.clear()
 
-    def detect(self, keypoints: np.ndarray) -> Tuple[PoseActionTypeEnum, float]:
+    def detect(
+        self, keypoints: np.ndarray, **kwargs
+    ) -> Tuple[PoseActionTypeEnum, float]:
         """
         Detect the pose activity using heuristics.
 
         Args:
             keypoints: NumPy array of shape (num_points, 3) where each row is [x, y, confidence]
+            **kwargs: Additional arguments (frame_width, frame_height) - ignored by heuristic detector
 
         Returns:
             Tuple of (action_type, confidence)
