@@ -6,9 +6,6 @@ from multiprocessing.synchronize import Event as MpEvent
 import numpy as np
 
 from frigate.config import CameraConfig
-from frigate.pose_activity_detectors import create_activity_detector
-from frigate.pose_activity_detectors.base import PoseActivityDetector
-from frigate.pose_activity_detectors.detector_config import create_detector_config
 from frigate.pose_detection.base import RemotePoseDetector
 from frigate.pose_detection.tensor_utils import (
     COCO_NUM_KEYPOINTS,
@@ -58,13 +55,9 @@ class PoseDetectionIntegration:
         self._rgb_buffer = None
         self._rgb_buffer_shape = None
 
-        # Activity detector for pose action classification
-        self.activity_detector: PoseActivityDetector = None
-
         # Only initialize if pose detection is enabled for this camera
         if self.pose_config.enabled:
             self.initialize_detector()
-            self.initialize_activity_detector()
 
     def initialize_detector(self):
         """Initialize the pose detector for this camera."""
@@ -99,55 +92,6 @@ class PoseDetectionIntegration:
                 f"Error initializing pose detector for {self.camera_name}: {e}"
             )
             self.pose_detector = None
-
-    def initialize_activity_detector(self):
-        """Initialize the activity detector for pose action classification."""
-        try:
-            # Get activity detector config from pose config
-            if (
-                hasattr(self.pose_config, "activity_detector")
-                and self.pose_config.activity_detector
-            ):
-                config_dict = self.pose_config.activity_detector.model_dump()
-                logger.info(
-                    f"Initializing {config_dict.get('type', 'unknown')} activity detector for camera {self.camera_name}"
-                )
-            else:
-                # Default to heuristic detector
-                config_dict = {"type": "heuristic"}
-                logger.info(
-                    f"No activity detector configured for {self.camera_name}, using default heuristic detector"
-                )
-
-            # Create detector configuration
-            detector_config = create_detector_config(config_dict)
-            if detector_config is None:
-                logger.error(
-                    f"Failed to create detector configuration for camera {self.camera_name}"
-                )
-                return
-
-            # Create activity detector instance
-            self.activity_detector = create_activity_detector(detector_config)
-            if self.activity_detector and self.activity_detector.initialized:
-                logger.info(
-                    f"Successfully initialized activity detector for camera {self.camera_name}: {detector_config.type}"
-                )
-            else:
-                logger.warning(
-                    f"Activity detector initialization failed for {self.camera_name}, falling back to heuristic"
-                )
-                # Try heuristic as fallback
-                fallback_config = create_detector_config({"type": "heuristic"})
-                if fallback_config:
-                    self.activity_detector = create_activity_detector(fallback_config)
-        except Exception as e:
-            logger.error(
-                f"Error initializing activity detector for {self.camera_name}: {e}"
-            )
-            import traceback
-
-            logger.error(traceback.format_exc())
 
     def detect_poses(self, frame, frame_time, motion_boxes, regions):
         """Detect poses in the frame.
@@ -682,10 +626,6 @@ class PoseDetectionIntegration:
                 frame_width=frame_width,
                 frame_height=frame_height,
             )
-
-            # Assign the activity detector for pose action analysis
-            if self.activity_detector and self.activity_detector.initialized:
-                tracked_pose.active_detector = self.activity_detector
 
             # Mark as not a false positive since it just got detected
             tracked_pose.false_positive = False
