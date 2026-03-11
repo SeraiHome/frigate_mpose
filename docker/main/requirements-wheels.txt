@@ -83,4 +83,4 @@ soundfile==0.13.*
 # DeGirum detector
 degirum == 0.16.*
 # mediapipe
-mediapipe
+mediapipe == 0.10.*

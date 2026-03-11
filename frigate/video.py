@@ -1166,14 +1166,20 @@ def process_frames(
                             continue
 
                         obj_box = tuple(obj["box"])
-                        # Find matching pose detection by box proximity
+                        # Find matching pose detection by IoU
                         for pose_box, pose_det in pose_det_map.items():
-                            if obj_box == pose_box or (
-                                abs(obj_box[0] - pose_box[0]) < 10
-                                and abs(obj_box[1] - pose_box[1]) < 10
-                                and abs(obj_box[2] - pose_box[2]) < 10
-                                and abs(obj_box[3] - pose_box[3]) < 10
-                            ):
+                            ix1 = max(obj_box[0], pose_box[0])
+                            iy1 = max(obj_box[1], pose_box[1])
+                            ix2 = min(obj_box[2], pose_box[2])
+                            iy2 = min(obj_box[3], pose_box[3])
+                            if ix2 > ix1 and iy2 > iy1:
+                                inter = (ix2 - ix1) * (iy2 - iy1)
+                                oa = max(1, (obj_box[2] - obj_box[0]) * (obj_box[3] - obj_box[1]))
+                                pa = max(1, (pose_box[2] - pose_box[0]) * (pose_box[3] - pose_box[1]))
+                                iou = inter / (oa + pa - inter)
+                            else:
+                                iou = 0.0
+                            if iou > 0.3:
                                 # Merge tracker's ID/timing with pose data
                                 pose_det["id"] = obj["id"]
                                 pose_det["start_time"] = obj.get(

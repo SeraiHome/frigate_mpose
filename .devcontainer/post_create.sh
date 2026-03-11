@@ -2,6 +2,9 @@
 
 set -euxo pipefail
 
+# Ensure git treats the mounted workspace as safe (ownership differs on Windows hosts)
+git config --global --add safe.directory /workspace/frigate 2>/dev/null || true
+
 # Cleanup the old github host key
 if [[ -f ~/.ssh/known_hosts ]]; then
   # Add new github host key
@@ -13,15 +16,23 @@ fi
 # Frigate normal container runs as root, so it have permission to create
 # the folders. But the devcontainer runs as the host user, so we need to
 # create the folders and give the host user permission to write to them.
-sudo mkdir -p /media/frigate
-sudo chown -R "$(id -u):$(id -g)" /media/frigate
+if command -v sudo &>/dev/null; then
+  sudo mkdir -p /media/frigate
+  sudo chown -R "$(id -u):$(id -g)" /media/frigate
+else
+  mkdir -p /media/frigate 2>/dev/null || true
+fi
 
 # When started as a service, LIBAVFORMAT_VERSION_MAJOR is defined in the
 # s6 service file. For dev, where frigate is started from an interactive
 # shell, we define it in .bashrc instead.
 echo 'export LIBAVFORMAT_VERSION_MAJOR=$("$(python3 /usr/local/ffmpeg/get_ffmpeg_path.py)" -version | grep -Po "libavformat\W+\K\d+")' >> "$HOME/.bashrc"
 
-make version
+if [[ -f Makefile ]] && git rev-parse --git-dir &>/dev/null; then
+  make version
+else
+  echo "Skipping 'make version' — Makefile or git history not available" >&2
+fi
 
 cd web
 

@@ -262,6 +262,8 @@ RUN --mount=type=bind,source=docker/main/install_memryx.sh,target=/deps/install_
 
 COPY --from=deps-rootfs / /
 
+RUN chmod +x /etc/s6-overlay/s6-rc.d/*/run /etc/s6-overlay/s6-rc.d/*/finish 2>/dev/null || true
+
 RUN ldconfig
 
 EXPOSE 5000
@@ -285,6 +287,9 @@ FROM deps AS devcontainer
 # Do not start the actual Frigate service on devcontainer as it will be started by VS Code
 # But start a fake service for simulating the logs
 COPY docker/main/fake_frigate_run /etc/s6-overlay/s6-rc.d/frigate/run
+# Override finish scripts so failed services don't halt the container
+COPY docker/main/devcontainer_service_finish /etc/s6-overlay/s6-rc.d/frigate/finish
+COPY docker/main/devcontainer_service_finish /etc/s6-overlay/s6-rc.d/nginx/finish
 
 # Create symbolic link to the frigate source code, as go2rtc's create_config.sh uses it
 RUN mkdir -p /opt/frigate \
@@ -301,8 +306,17 @@ RUN curl -SLO https://deb.nodesource.com/nsolid_setup_deb.sh && \
 WORKDIR /workspace/frigate
 
 RUN apt-get update \
-    && apt-get install make -y \
+    && apt-get install git make sudo -y \
     && rm -rf /var/lib/apt/lists/*
+
+# Create vscode user for devcontainer (common-utils feature expects sudo)
+RUN groupadd --gid 1000 vscode \
+    && useradd --uid 1000 --gid 1000 -m -s /bin/bash vscode \
+    && echo "vscode ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/vscode \
+    && chmod 0440 /etc/sudoers.d/vscode
+
+# Mark workspace as safe for git (ownership differs between host and container)
+RUN git config --system --add safe.directory /workspace/frigate
 
 RUN --mount=type=bind,source=./docker/main/requirements-dev.txt,target=/workspace/frigate/requirements-dev.txt \
     pip3 install -r requirements-dev.txt
