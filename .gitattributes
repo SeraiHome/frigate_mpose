@@ -1,0 +1,8 @@
+# Force LF line endings for all files that run inside Linux containers
+*.sh text eol=lf
+Dockerfile* text eol=lf
+docker/main/rootfs/** text eol=lf
+docker/main/fake_frigate_run text eol=lf
+docker/main/devcontainer_service_finish text eol=lf
+.devcontainer/** text eol=lf
+.gitattributes text eol=lf

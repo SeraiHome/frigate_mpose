@@ -3,10 +3,14 @@
   "dockerComposeFile": "../docker-compose.yml",
   "service": "devcontainer",
   "workspaceFolder": "/workspace/frigate",
-  "initializeCommand": ".devcontainer/initialize.sh",
+  "initializeCommand": "bash .devcontainer/initialize.sh",
   "postCreateCommand": ".devcontainer/post_create.sh",
   "overrideCommand": false,
   "remoteUser": "vscode",
+  "mounts": [
+    "source=${localEnv:USERPROFILE}/.claude,target=/home/vscode/.claude,type=bind,consistency=cached",
+    "source=${localEnv:USERPROFILE}/.claude.json,target=/home/vscode/.claude.json,type=bind,consistency=cached"
+  ],
   "features": {
     "ghcr.io/devcontainers/features/common-utils:2": {},
     // Uncomment the following lines to use ONNX Runtime with CUDA support
@@ -53,6 +57,7 @@
   "customizations": {
     "vscode": {
       "extensions": [
+        "anthropic.claude-code",
         "ms-python.python",
         "ms-python.vscode-pylance",
         "visualstudioexptteam.vscodeintellicode",

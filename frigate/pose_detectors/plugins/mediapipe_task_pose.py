@@ -118,8 +118,12 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
             from mediapipe.tasks import python
             from mediapipe.tasks.python import vision
 
-            # Store drawing utilities for visualization
-            self.mp_drawing = mp.solutions.drawing_utils
+            # Store drawing utilities for visualization (optional, removed in newer mediapipe)
+            try:
+                self.mp_drawing = mp.solutions.drawing_utils
+            except AttributeError:
+                logger.info("mp.solutions.drawing_utils not available in mediapipe %s, debug visualization will use cv2 fallback", getattr(mp, '__version__', 'unknown'))
+                self.mp_drawing = None
 
             # Import necessary classes for landmark conversion
             from mediapipe.framework.formats import landmark_pb2
@@ -346,9 +350,22 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
                             (29, 31),
                             (30, 32),
                         ]
-                        self.mp_drawing.draw_landmarks(
-                            vis_image, landmark_list, connections
-                        )
+                        if self.mp_drawing is not None:
+                            self.mp_drawing.draw_landmarks(
+                                vis_image, landmark_list, connections
+                            )
+                        else:
+                            # cv2 fallback: draw keypoints and connections directly
+                            h, w = vis_image.shape[:2]
+                            pts = {}
+                            for lm in landmark_list.landmark:
+                                idx = len(pts)
+                                px, py = int(lm.x * w), int(lm.y * h)
+                                pts[idx] = (px, py)
+                                cv2.circle(vis_image, (px, py), 3, (0, 255, 0), -1)
+                            for c_start, c_end in connections:
+                                if c_start in pts and c_end in pts:
+                                    cv2.line(vis_image, pts[c_start], pts[c_end], (0, 255, 0), 2)
 
                     # Convert RGB to BGR for OpenCV's imwrite
                     vis_image_bgr = cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR)

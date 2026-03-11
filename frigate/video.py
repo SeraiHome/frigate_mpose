@@ -1083,65 +1083,6 @@ def process_frames(
                     frame, frame_time, motion_boxes, regions
                 )
 
-                if camera_config.detect.enabled:
-                    # Object detection is enabled - enrich existing person detections
-                    # with pose action data instead of creating separate detections.
-                    # Match poses to existing tracked objects by bounding box overlap.
-                    for pose in tracked_poses:
-                        if not pose.bbox or len(pose.bbox) != 4:
-                            continue
-                        try:
-                            px, py, pw, ph = [int(v) for v in pose.bbox]
-                            pose_box = (px, py, px + pw, py + ph)
-                        except Exception:
-                            continue
-
-                        # Get action label
-                        if hasattr(pose, "action"):
-                            a = pose.action
-                            action_label = a.value if hasattr(a, "value") else str(a)
-                        else:
-                            action_label = None
-
-                        # Find matching object detection by IoU
-                        best_match_id = None
-                        best_iou = 0.3  # Minimum IoU threshold
-
-                        for obj_id, obj in detections.items():
-                            if obj.get("label") != "person":
-                                continue
-                            obj_box = obj.get("box", [])
-                            if len(obj_box) != 4:
-                                continue
-
-                            # Calculate IoU
-                            x1 = max(pose_box[0], obj_box[0])
-                            y1 = max(pose_box[1], obj_box[1])
-                            x2 = min(pose_box[2], obj_box[2])
-                            y2 = min(pose_box[3], obj_box[3])
-
-                            if x2 > x1 and y2 > y1:
-                                intersection = (x2 - x1) * (y2 - y1)
-                                pose_area = (pose_box[2] - pose_box[0]) * (
-                                    pose_box[3] - pose_box[1]
-                                )
-                                obj_area = (obj_box[2] - obj_box[0]) * (
-                                    obj_box[3] - obj_box[1]
-                                )
-                                union = pose_area + obj_area - intersection
-                                iou = intersection / union if union > 0 else 0
-
-                                if iou > best_iou:
-                                    best_iou = iou
-                                    best_match_id = obj_id
-
-                        # Enrich the matched detection with pose action
-                        if best_match_id and action_label:
-                            detections[best_match_id]["sub_label"] = (
-                                action_label,
-                                float(getattr(pose, "action_confidence", 0.0) or 0.0),
-                            )
-
             # When object detection is disabled but pose detection found people,
             # inject pose detections directly into the object tracker so they
             # become tracked objects that can receive action sub-labels
@@ -1225,14 +1166,20 @@ def process_frames(
                             continue
 
                         obj_box = tuple(obj["box"])
-                        # Find matching pose detection by box proximity
+                        # Find matching pose detection by IoU
                         for pose_box, pose_det in pose_det_map.items():
-                            if obj_box == pose_box or (
-                                abs(obj_box[0] - pose_box[0]) < 10
-                                and abs(obj_box[1] - pose_box[1]) < 10
-                                and abs(obj_box[2] - pose_box[2]) < 10
-                                and abs(obj_box[3] - pose_box[3]) < 10
-                            ):
+                            ix1 = max(obj_box[0], pose_box[0])
+                            iy1 = max(obj_box[1], pose_box[1])
+                            ix2 = min(obj_box[2], pose_box[2])
+                            iy2 = min(obj_box[3], pose_box[3])
+                            if ix2 > ix1 and iy2 > iy1:
+                                inter = (ix2 - ix1) * (iy2 - iy1)
+                                oa = max(1, (obj_box[2] - obj_box[0]) * (obj_box[3] - obj_box[1]))
+                                pa = max(1, (pose_box[2] - pose_box[0]) * (pose_box[3] - pose_box[1]))
+                                iou = inter / (oa + pa - inter)
+                            else:
+                                iou = 0.0
+                            if iou > 0.3:
                                 # Merge tracker's ID/timing with pose data
                                 pose_det["id"] = obj["id"]
                                 pose_det["start_time"] = obj.get(
