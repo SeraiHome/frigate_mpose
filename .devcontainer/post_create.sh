@@ -5,6 +5,17 @@ set -euxo pipefail
 # Ensure git treats the mounted workspace as safe (ownership differs on Windows hosts)
 git config --global --add safe.directory /workspace/frigate 2>/dev/null || true
 
+# Windows host mounts files with CRLF; tell git to handle the conversion
+# transparently (CRLF in working tree ↔ LF in repo) to prevent phantom diffs
+git config core.autocrlf true
+
+# Setup user-level npm global directory (avoids EACCES errors with global installs)
+mkdir -p ~/.npm-global
+npm config set prefix '~/.npm-global'
+if ! grep -q 'npm-global' "$HOME/.bashrc" 2>/dev/null; then
+  echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> "$HOME/.bashrc"
+fi
+
 # Cleanup the old github host key
 if [[ -f ~/.ssh/known_hosts ]]; then
   # Add new github host key
