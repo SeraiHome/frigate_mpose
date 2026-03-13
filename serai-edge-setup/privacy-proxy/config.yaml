@@ -1,0 +1,21 @@
+# Privacy proxy configuration
+mqtt_host: localhost
+mqtt_port: 1883
+
+pre_event_seconds: 30    # Ring buffer duration for pre-event real frames
+post_event_seconds: 60   # How long to show real frames after fall detected
+
+cameras:
+  - name: living_room
+    width: 1280
+    height: 720
+    fps: 5
+    real_rtsp_url: rtsp://go2rtc:1984/living_room_real
+    output_rtsp_url: rtsp://localhost:8554/living_room_priv
+
+  - name: bedroom
+    width: 1280
+    height: 720
+    fps: 5
+    real_rtsp_url: rtsp://go2rtc:1984/bedroom_real
+    output_rtsp_url: rtsp://localhost:8554/bedroom_priv

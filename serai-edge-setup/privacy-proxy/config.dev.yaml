@@ -1,0 +1,16 @@
+# Privacy proxy dev configuration
+# Serves skeleton frames over TCP; Frigate reads directly
+# Real frames sourced from go2rtc relay (single camera connection)
+mqtt_host: mqtt
+mqtt_port: 1883
+
+pre_event_seconds: 30
+post_event_seconds: 60
+
+cameras:
+  - name: iphone
+    width: 1280
+    height: 720
+    fps: 30
+    real_rtsp_url: rtsp://frigate-devcontainer:8554/iphone_real
+    tcp_port: 9000

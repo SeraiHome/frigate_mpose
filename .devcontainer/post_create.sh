@@ -16,10 +16,24 @@ fi
 sudo mkdir -p /media/frigate
 sudo chown -R "$(id -u):$(id -g)" /media/frigate
 
+# Fix ownership of Claude data volume (Docker creates named volumes as root)
+sudo chown -R "$(id -u):$(id -g)" "$HOME/.claude" 2>/dev/null || true
+
 # When started as a service, LIBAVFORMAT_VERSION_MAJOR is defined in the
 # s6 service file. For dev, where frigate is started from an interactive
 # shell, we define it in .bashrc instead.
 echo 'export LIBAVFORMAT_VERSION_MAJOR=$("$(python3 /usr/local/ffmpeg/get_ffmpeg_path.py)" -version | grep -Po "libavformat\W+\K\d+")' >> "$HOME/.bashrc"
+
+# Setup user-level npm global directory (avoids EACCES on global installs)
+mkdir -p ~/.npm-global
+npm config set prefix '~/.npm-global'
+if ! grep -q 'npm-global' "$HOME/.bashrc" 2>/dev/null; then
+  echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> "$HOME/.bashrc"
+fi
+export PATH="$HOME/.npm-global/bin:$PATH"
+
+# Install Claude Code CLI (the VSCode extension delegates to this)
+npm install -g @anthropic-ai/claude-code
 
 make version
 

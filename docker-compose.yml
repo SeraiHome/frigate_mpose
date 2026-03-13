@@ -28,6 +28,14 @@ services:
     devices:
       - /dev/bus/usb:/dev/bus/usb # Uncomment for Google Coral USB
       # - /dev/dri:/dev/dri # for intel hwaccel, needs to be updated for your hardware
+    ports:
+      - "5000:5000"   # Internal NGINX
+      - "5001:5001"   # Frigate API
+      - "5173:5173"   # Vite Server
+      - "8971:8971"   # External NGINX (HTTPS)
+      - "8554:8554"   # go2rtc RTSP
+      - "8555:8555/tcp" # go2rtc WebRTC
+      - "8555:8555/udp" # go2rtc WebRTC
     volumes:
       - .:/workspace/frigate:cached
       - ./web/dist:/opt/frigate/web:cached
@@ -35,9 +43,24 @@ services:
       - ./config:/config
       - ./debug:/media/frigate
       - /dev/bus/usb:/dev/bus/usb # Uncomment for Google Coral USB
+      - claude-data:/home/vscode/.claude # Persist Claude auth & history
   mqtt:
     container_name: mqtt
     image: eclipse-mosquitto:2.0
     command: mosquitto -c /mosquitto-no-auth.conf # enable no-auth mode
     ports:
       - "1893:1883" #offset to avoid conflict with host mqtt broker
+  privacy-proxy:
+    container_name: privacy-proxy
+    build: ./serai-edge-setup/privacy-proxy
+    restart: unless-stopped
+    volumes:
+      - ./serai-edge-setup/privacy-proxy/config.dev.yaml:/config/config.yaml:ro
+      - ./debug:/media/frigate   # For pre-event buffer writes
+    depends_on:
+      - mqtt
+    # Dev: use default bridge network so container names resolve
+    # Prod: use network_mode: host
+
+volumes:
+  claude-data: # Named volume to persist Claude auth & history across rebuilds

@@ -514,6 +514,7 @@ class FrigateApp:
                 self.config,
                 self.dispatcher,
                 self.stop_event,
+                camera_metrics=self.camera_metrics,
                 ptz_autotracker_thread=self.ptz_autotracker_thread,
                 detected_frames_queue=self.detected_frames_queue,
             )

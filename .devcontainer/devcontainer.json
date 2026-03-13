@@ -3,7 +3,7 @@
   "dockerComposeFile": "../docker-compose.yml",
   "service": "devcontainer",
   "workspaceFolder": "/workspace/frigate",
-  "initializeCommand": ".devcontainer/initialize.sh",
+  "initializeCommand": "bash .devcontainer/initialize.sh",
   "postCreateCommand": ".devcontainer/post_create.sh",
   "overrideCommand": false,
   "remoteUser": "vscode",
@@ -50,9 +50,16 @@
       "onAutoForward": "silent"
     }
   },
+  "postStartCommand": "bash .devcontainer/claude-persist.sh restore",
+  "postAttachCommand": "bash .devcontainer/claude-persist.sh save",
+  "remoteEnv": {
+    "DEVCONTAINER": "true",
+    "NODE_OPTIONS": "--max-old-space-size=4096"
+  },
   "customizations": {
     "vscode": {
       "extensions": [
+        "anthropic.claude-code",
         "ms-python.python",
         "ms-python.vscode-pylance",
         "visualstudioexptteam.vscodeintellicode",
@@ -69,7 +76,7 @@
         "eamodio.gitlens"
       ],
       "settings": {
-        "remote.autoForwardPorts": false,
+        "remote.autoForwardPorts": true,
         "python.formatting.provider": "none",
         "python.languageServer": "Pylance",
         "editor.formatOnPaste": false,
