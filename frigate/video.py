@@ -30,6 +30,10 @@ from frigate.motion import MotionDetector
 from frigate.motion.improved_motion import ImprovedMotionDetector
 from frigate.object_detection.base import RemoteObjectDetector
 from frigate.pose_detection.integration import PoseDetectionIntegration
+from frigate.pose_detection.privacy_renderer import (
+    render_skeleton_yuv,
+    render_no_detection_yuv,
+)
 from frigate.ptz.autotrack import ptz_moving_at_frame_time
 from frigate.track import ObjectTracker
 from frigate.track.norfair_tracker import NorfairTracker
@@ -662,6 +666,15 @@ def detect(
     return detections
 
 
+def _check_privacy_override(frame_time: float, camera_metrics: "CameraMetrics") -> bool:
+    """Check if privacy override is active (real frames requested during event).
+
+    Uses the shared multiprocessing Value in CameraMetrics so the override
+    set by pose_consumer (main process) is visible in the camera subprocess.
+    """
+    return frame_time < camera_metrics.privacy_override_until.value
+
+
 def process_frames(
     requestor: InterProcessRequestor,
     frame_queue: Queue,
@@ -1193,6 +1206,40 @@ def process_frames(
                                 )
                                 detections[obj["id"]] = pose_det
                                 break
+
+            # --- PRIVACY MODE: Replace SHM frame with skeleton render ---
+            # All detection/tracking has run on real frames above. Now swap the
+            # SHM contents so downstream consumers (web UI, JSMPEG, birdseye,
+            # snapshots) see skeletons instead of real camera footage.
+            if (
+                pose_enabled
+                and camera_config.pose.privacy_mode
+                and not _check_privacy_override(frame_time, camera_metrics)
+            ):
+                # Get background image from motion detector if "scene" mode
+                privacy_bg = None
+                if camera_config.pose.privacy_background == "scene":
+                    privacy_bg = motion_detector.avg_frame
+
+                if tracked_poses:
+                    skeleton_frame = render_skeleton_yuv(
+                        tracked_poses,
+                        (frame_shape[0], frame_shape[1]),
+                        bg_image=privacy_bg,
+                    )
+                else:
+                    skeleton_frame = render_no_detection_yuv(
+                        (frame_shape[0], frame_shape[1]),
+                        bg_image=privacy_bg,
+                    )
+
+                # Overwrite the frame in shared memory
+                current_frame = frame_manager.get(
+                    frame_name, (frame_shape[0] * 3 // 2, frame_shape[1])
+                )
+                if current_frame is not None:
+                    current_frame[:] = skeleton_frame
+            # --- END PRIVACY MODE ---
 
             detected_objects_queue.put(
                 (

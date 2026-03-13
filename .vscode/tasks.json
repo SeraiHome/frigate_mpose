@@ -1,0 +1,15 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Kill stale FFmpeg processes",
+      "type": "shell",
+      "command": "pkill -f 'ffmpeg.*iphone' 2>/dev/null; echo 'Stale FFmpeg processes cleaned up'",
+      "presentation": {
+        "reveal": "silent",
+        "close": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}

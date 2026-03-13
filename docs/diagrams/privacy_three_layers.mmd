@@ -1,0 +1,32 @@
+%%{init: {'theme': 'dark', 'themeVariables': {'primaryColor': '#1a1a2e', 'lineColor': '#e94560'}}}%%
+graph LR
+    subgraph LAYER1 ["Layer 1: SHM Frame Substitution"]
+        direction TB
+        L1_IN["Real frame after<br/>pose detection"] --> L1_RENDER["Privacy Renderer<br/>(YUV I420)"]
+        L1_RENDER --> L1_SHM["Replace frame in SHM"]
+        L1_SHM --> L1_JSMPEG["JSMPEG Live View"]
+        L1_SHM --> L1_BIRD["Birdseye"]
+        L1_SHM --> L1_SNAP["Snapshots"]
+        L1_SHM --> L1_API["API Image Endpoints"]
+    end
+
+    subgraph LAYER2 ["Layer 2: Proxy TCP Stream"]
+        direction TB
+        L2_MQTT["MQTT Keypoints"] --> L2_RENDER["Skeleton Renderer<br/>(BGR24)"]
+        L2_RENDER --> L2_TCP["TCP Socket :9000"]
+        L2_TCP --> L2_FFMPEG["Frigate Record FFmpeg"]
+        L2_FFMPEG --> L2_MP4["MP4 Segments"]
+
+        L2_BUF["Pre-event JPEG Buffer<br/>(300 frames / 10s)"] -.->|"On override"| L2_TCP
+    end
+
+    subgraph LAYER3 ["Layer 3: go2rtc Live View"]
+        direction TB
+        L3_NORMAL["Normal: no 'iphone' stream<br/>→ JSMPEG fallback<br/>→ SHM skeletons"]
+        L3_OVERRIDE["Override: PUT API<br/>iphone → iphone_real<br/>→ WebRTC real frames"]
+        L3_WATCHDOG["Watchdog polls 2s<br/>→ Restores privacy<br/>when override expires"]
+
+        L3_NORMAL --> L3_OVERRIDE
+        L3_OVERRIDE --> L3_WATCHDOG
+        L3_WATCHDOG --> L3_NORMAL
+    end

@@ -1,6 +1,13 @@
 mqtt:
   host: mqtt
 
+go2rtc:
+  streams:
+    # Real camera (used by detect + proxy pre-event, NOT exposed as "iphone"
+    # so the web UI falls back to JSMPEG which reads from SHM with skeleton substitution)
+    iphone_real:
+      - rtsp://192.168.1.71:8554/live.sdp
+
 logger:
   default: info
   logs:
@@ -46,15 +53,13 @@ pose_model:
 
 cameras:
   test_camera:
-    enabled: true
+    enabled: false
     ffmpeg:
       inputs:
         - path: /config/Lei2/Coffee_room_02/Videos/video_56_mjpeg.avi
-          input_args: -re -stream_loop -1
           roles:
-            - detect
-            - rtmp
             - record
+            - detect
     detect:
       enabled: false
     #   width: 720
@@ -78,6 +83,14 @@ cameras:
 
     record:
       enabled: true
+      alerts:
+        retain:
+          days: 1
+          mode: motion
+      detections:
+        retain:
+          days: 1
+          mode: motion
     zones:
       floor:
         coordinates: 0.266,0.599,0.274,1,0.843,0.994,0.965,0.992,0.646,0.583
@@ -92,6 +105,9 @@ cameras:
     pose:
       enabled: true
       publish_to_detected_objects: true
+      privacy_mode: true
+      privacy_background: scene  # "black" (solid) or "scene" (room background from motion detector)
+      publish_keypoints: true
       # detector: mediapipe_task # Use the new MediaPipe Task API detector
       confidence_threshold: 0.01
       skip_frames: 0
@@ -103,7 +119,8 @@ cameras:
       activity_detector:
         type: stgcn_fall
         # Use a model path that will be checked in order of existence
-        model_path: /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/window_60_random_fps_2_le2i_montreal_clips_f1_edgetpu.tflite
+        model_path: 
+          /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/window_60_random_fps_2_le2i_montreal_clips_f1_edgetpu.tflite
         confidence_threshold: 0.5
         num_threads: 3
         effective_window_size: 40
@@ -145,15 +162,13 @@ cameras:
       improve_contrast: true
 
   test_camera2:
-    enabled: true
+    enabled: false
     ffmpeg:
       inputs:
         - path: /config/Lei2/Coffee_room_02/Videos/video_55_mjpeg.avi
-          input_args: -re -stream_loop -1
           roles:
-            - detect
-            - rtmp
             - record
+            - detect
     detect:
       enabled: false
     #   width: 720
@@ -177,6 +192,14 @@ cameras:
 
     record:
       enabled: true
+      alerts:
+        retain:
+          days: 1
+          mode: motion
+      detections:
+        retain:
+          days: 1
+          mode: motion
 
     zones:
       floor:
@@ -191,6 +214,9 @@ cameras:
     pose:
       enabled: true
       publish_to_detected_objects: true
+      privacy_mode: true
+      privacy_background: scene  # "black" (solid) or "scene" (room background from motion detector)
+      publish_keypoints: true
       # detector: mediapipe # Use the MediaPipe pose detector defined in pose_detectors section
       confidence_threshold: 0.1
       # keypoint_threshold: 0.3
@@ -199,7 +225,8 @@ cameras:
       # Activity detector configuration
       activity_detector:
         type: stgcn_fall
-        model_path: /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/stgcn_window_60_le2i_montreal.tflite
+        model_path: 
+          /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/stgcn_window_60_le2i_montreal.tflite
         confidence_threshold: 0.5
         num_threads: 3
         effective_window_size: 40
@@ -293,7 +320,8 @@ cameras:
       # Activity detector configuration
       activity_detector:
         type: stgcn_fall
-        model_path: /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/window_60_random_fps_2_le2i_montreal_clips_f1_edgetpu.tflite
+        model_path: 
+          /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/window_60_random_fps_2_le2i_montreal_clips_f1_edgetpu.tflite
         confidence_threshold: 0.1
         num_threads: 3
         effective_window_size: 40
@@ -371,7 +399,8 @@ cameras:
       # Activity detector configuration
       activity_detector:
         type: stgcn_fall
-        model_path: /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/stgcn_window_60_le2i_montreal.tflite
+        model_path: 
+          /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/stgcn_window_60_le2i_montreal.tflite
         confidence_threshold: 0.7
         num_threads: 3
 
@@ -406,29 +435,66 @@ cameras:
       #   threshold: 0.5
 
   iphone:
-    enabled: false
+    enabled: true
     ffmpeg:
       inputs:
-        - path: rtsp://192.168.1.71:8554/live.sdp
+        # Real source for detection via go2rtc relay (single camera connection)
+        - path: rtsp://127.0.0.1:8554/iphone_real
           input_args: -rtsp_transport tcp
-
           roles:
-            # - detect
-            - rtmp
-            # - record
-    #     hwaccel_args: preset-vaapi
-    # detect:
-    #   enabled: true
-    #   #      width: 420
-    #   #      height: 720
-    #   fps: 5
-    # min_initialized: 1
-    # max_disappeared: 2
-    # stationary:
-    #   interval:
-
-    # record:
-    #   enabled: true
+            - detect
+        # Privacy proxy output: read raw frames directly from proxy TCP
+        - path: tcp://privacy-proxy:9000
+          input_args: -f rawvideo -pix_fmt bgr24 -video_size 1280x720 -framerate 30
+          roles:
+            - record
+      output_args:
+        record: -f segment -segment_time 10 -segment_format mp4 -reset_timestamps 1 -strftime 1 -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -an
+    detect:
+      enabled: false
+    snapshots:
+      enabled: true
+      clean_copy: true
+      timestamp: false
+      bounding_box: true
+      crop: false
+      height: 175
+    record:
+      enabled: true
+      alerts:
+        retain:
+          days: 1
+          mode: all
+      detections:
+        retain:
+          days: 1
+          mode: all
+    pose:
+      enabled: true
+      publish_to_detected_objects: true
+      privacy_mode: true
+      privacy_background: scene
+      publish_keypoints: true
+      confidence_threshold: 0.1
+      skip_frames: 0
+      use_motion_roi: false
+      activity_detector:
+        type: stgcn_fall
+        model_path:
+          /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/stgcn_window_60_le2i_montreal.tflite
+        confidence_threshold: 0.5
+        num_threads: 3
+        effective_window_size: 40
+      actions:
+        - falling
+      snapshot_actions:
+        - falling
+      record_actions:
+        - falling
+    motion:
+      threshold: 48
+      contour_area: 78
+      improve_contrast: true
 
   rpicamera:
     # Run camera_to_v4l2.sh on the raspberry pi for the camera to work.
@@ -436,8 +502,7 @@ cameras:
     enabled: false
     ffmpeg:
       inputs:
-        - path:
-            /dev/video10
+        - path: /dev/video10
             # make sure to copy the same args in camera_to_v4l2.sh
           input_args:
             - -f
@@ -447,7 +512,7 @@ cameras:
             - -video_size
             - 640x480
             - -framerate
-            - "30"
+            - '30'
           roles:
             # - detect
             - rtmp

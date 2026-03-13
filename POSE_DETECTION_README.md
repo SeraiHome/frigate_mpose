@@ -688,6 +688,208 @@ ruff check frigate/pose_detection frigate/pose_detectors frigate/pose_activity_d
 
 ---
 
+## Privacy Mode
+
+Privacy mode ensures that **real camera footage of monitored individuals is never stored or transmitted** during normal operation. All visual outputs show pose skeleton overlays instead. When a configured action (e.g., a fall) is detected, the system temporarily switches to real footage for a configurable event window.
+
+This is designed for elderly care deployments where continuous video surveillance raises privacy concerns, but fall detection must still capture real footage for caregiver review.
+
+### How It Works
+
+Privacy mode operates through **three independent layers**, each covering a different output path:
+
+```
+Real Camera (RTSP)
+       │
+       ▼
+    go2rtc ─────────────────────────────────────┐
+       │                                         │
+       ▼                                         ▼
+  Frigate DETECT                          Privacy Proxy Sidecar
+  (always sees real frames)               (MQTT keypoints → skeleton)
+       │                                         │
+       ▼                                         │
+  ┌─ Layer 1: SHM Substitution ─┐    ┌─ Layer 2: TCP Stream ───┐
+  │ Replaces frame in shared     │    │ Serves skeleton BGR24   │
+  │ memory with skeleton render  │    │ frames over TCP :9000   │
+  │                              │    │ for Frigate record      │
+  │ Covers:                      │    │ FFmpeg to encode        │
+  │  • JSMPEG live view          │    │                         │
+  │  • Birdseye                  │    │ Covers:                 │
+  │  • Snapshots                 │    │  • MP4 recordings       │
+  │  • API image endpoints       │    │                         │
+  └──────────────────────────────┘    └─────────────────────────┘
+                                               │
+                                    ┌─ Layer 3: go2rtc API ─────┐
+                                    │ Dynamically switches the  │
+                                    │ go2rtc stream source      │
+                                    │ between dead URL (privacy)│
+                                    │ and real RTSP (override)  │
+                                    │                           │
+                                    │ Covers:                   │
+                                    │  • WebRTC/MSE live view   │
+                                    └───────────────────────────┘
+```
+
+**Layer 1 (SHM)** is built into Frigate. After pose detection runs on the real frame, the shared memory contents are replaced with a skeleton render. Everything downstream that reads SHM sees skeletons.
+
+**Layer 2 (Proxy TCP)** is a sidecar container. Frigate's record FFmpeg reads from the proxy's TCP socket instead of the camera directly. The proxy renders skeleton frames from MQTT keypoints published by Frigate.
+
+**Layer 3 (go2rtc API)** is also handled by the proxy sidecar. Normally the go2rtc stream for the camera points to a dead URL, so WebRTC/MSE fails and Frigate falls back to JSMPEG (which reads SHM skeletons). During override, the proxy switches the go2rtc stream to the real camera via the REST API.
+
+### Privacy Override (Event Window)
+
+When a configured action is detected (e.g., `falling` in `record_actions`), all three layers switch to real footage simultaneously:
+
+1. **SHM override**: `CameraMetrics.privacy_override_until` shared mp.Value is set — `process_frames()` in the camera subprocess skips skeleton substitution
+2. **MQTT signal**: `frigate/{camera}/privacy_override` published — proxy flushes its pre-event JPEG buffer (real footage from before the event) into the TCP stream, then passes through live real frames
+3. **go2rtc switch**: Proxy calls `PUT /api/streams` to point the camera's go2rtc stream at the real RTSP source — WebRTC/MSE shows real video
+
+After `privacy_override_seconds` (default 60s), all layers revert to skeleton mode automatically.
+
+**Trigger condition**: The override fires when ALL of these are true:
+- `privacy_mode: true` on the camera
+- The detected action is in `record_actions` (e.g., `falling`)
+- No override is already active (debounced per camera)
+
+### Configuration Reference
+
+```yaml
+cameras:
+  my_camera:
+    detect:
+      enabled: false          # Standalone pose mode (no object detection)
+
+    pose:
+      enabled: true
+      privacy_mode: true      # Enable skeleton substitution
+      privacy_background: scene  # "black" or "scene"
+      privacy_override_seconds: 60  # Real-frame window after trigger
+      publish_keypoints: true  # Required for proxy sidecar (Layer 2+3)
+
+      # Actions that trigger privacy override + recording retention
+      record_actions:
+        - falling
+
+      # Actions that trigger snapshots (independent of override)
+      snapshot_actions:
+        - falling
+
+      # Activity detector (produces the actions)
+      activity_detector:
+        type: stgcn_fall
+        model_path: /path/to/model.tflite
+        confidence_threshold: 0.5
+
+      # ROI cropping — disable for privacy cameras (see caveats below)
+      use_motion_roi: false
+
+    record:
+      enabled: true
+      alerts:
+        retain: { days: 1, mode: all }   # mode: all required when detect: false
+      detections:
+        retain: { days: 1, mode: all }
+
+    ffmpeg:
+      inputs:
+        # Real source for detection (ML always sees real frames)
+        - path: rtsp://127.0.0.1:8554/camera_real
+          input_args: -rtsp_transport tcp
+          roles: [detect]
+        # Privacy proxy TCP for recording (skeleton or real on override)
+        - path: tcp://privacy-proxy:9000
+          input_args: -f rawvideo -pix_fmt bgr24 -video_size 1280x720 -framerate 30
+          roles: [record]
+      output_args:
+        record: >-
+          -f segment -segment_time 10 -segment_format mp4 -reset_timestamps 1
+          -strftime 1 -c:v libx264 -preset ultrafast -tune zerolatency
+          -pix_fmt yuv420p -g 30 -an
+```
+
+### Privacy Mode Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `privacy_mode` | `false` | Enable skeleton substitution across all layers |
+| `privacy_background` | `black` | Background behind skeletons: `black` (solid) or `scene` (grayscale room from motion detector average frame — zero extra cost) |
+| `privacy_override_seconds` | `60` | Seconds of real footage shown after a trigger action is detected. Applies to SHM, proxy TCP, and go2rtc live view |
+| `publish_keypoints` | `false` | Publish COCO keypoints to MQTT. **Required** for the proxy sidecar to render skeletons for recordings and live view switching |
+| `record_actions` | — | Actions that trigger both recording retention AND privacy override. This is the link between fall detection and the override |
+| `use_motion_roi` | `false` | Crop to motion region before pose detection. **Recommended `false` for privacy cameras** — dynamic ROI size changes cause frame-size jitter in skeleton renders |
+
+### Recording & Detect Mode Interactions
+
+| `detect.enabled` | `pose.enabled` | `record.mode` | Notes |
+|---|---|---|---|
+| `false` | `true` | `all` | **Recommended for privacy cameras.** Pose-only, no object detection overhead. Must use `mode: all` because `mode: motion` requires detect. |
+| `true` | `true` | `motion` | Object detection + pose detection. More resource-intensive. Motion mode works because detect produces motion events. |
+| `false` | `true` | `motion` | **Will not record.** Motion mode requires detect to produce events. |
+
+### Output Matrix
+
+| Output | Normal (privacy) | Override (event) | Privacy disabled |
+|---|---|---|---|
+| JSMPEG live view | Skeleton (SHM) | Real RGB (SHM override) | Real RGB |
+| WebRTC/MSE live | Skeleton (JSMPEG fallback) | Real RGB (go2rtc switch) | Real RGB |
+| Birdseye | Skeleton (SHM) | Real RGB (SHM override) | Real RGB |
+| Recordings | Skeleton (proxy TCP) | Real RGB (pre-event flush + passthrough) | Real RGB |
+| Snapshots | Skeleton (SHM) | Real RGB (SHM override) | Real RGB |
+
+### Privacy Proxy Sidecar
+
+The proxy is a separate container that handles Layers 2 and 3. It:
+- Subscribes to `frigate/{camera}/pose_keypoints` via MQTT
+- Renders skeleton frames (BGR24) and serves them over a TCP socket
+- Maintains a pre-event ring buffer of real JPEG frames (configurable, default 10s at native fps)
+- On override: flushes buffer into TCP stream, passes through live RTSP frames, switches go2rtc
+- Monitors override expiry and restores privacy mode automatically
+
+**Proxy config** (`config.yaml`):
+
+```yaml
+mqtt_host: mqtt
+mqtt_port: 1883
+pre_event_seconds: 30    # Ring buffer duration (seconds of real footage before event)
+post_event_seconds: 60   # Should match privacy_override_seconds in Frigate config
+go2rtc_api_url: http://frigate:1984
+
+cameras:
+  - name: my_camera
+    width: 1280
+    height: 720
+    fps: 30              # Native camera fps for TCP stream
+    real_rtsp_url: rtsp://frigate:8554/camera_real
+    tcp_port: 9000
+```
+
+### Limitations
+
+**Privacy proxy requires a live RTSP stream.** The proxy captures real frames via RTSP for the pre-event buffer and override passthrough. This means:
+
+- **Local video files (e.g., Lei2 test dataset) cannot be used with the proxy.** The proxy's pre-event capture thread will fail to connect and retry indefinitely (with backoff). The TCP skeleton stream still works (renders from MQTT keypoints), but override passthrough will show black frames instead of real footage.
+- **Layer 1 (SHM substitution) works with any input source**, including local files. You can test skeleton rendering in the web UI with test videos — only recording override is affected.
+- **To test the full override flow**, you need a live RTSP camera source (or an RTSP simulator like `mediamtx` serving a looped video file).
+
+**`use_motion_roi: true` not recommended for privacy cameras.** Motion ROI causes the detection crop region to change size frame-to-frame, which produces jitter in skeleton renders. Use `use_motion_roi: false` for stable privacy output.
+
+**go2rtc stream naming convention.** The real camera stream in go2rtc must be named `{camera}_real` (e.g., `iphone_real`). The camera's main stream name (e.g., `iphone`) is dynamically managed by the proxy — do NOT define it in go2rtc config.
+
+### Key Files
+
+| File | Layer | Purpose |
+|---|---|---|
+| `frigate/config/camera/pose.py` | — | `privacy_mode`, `privacy_background`, `privacy_override_seconds`, `publish_keypoints` fields |
+| `frigate/video.py` ~L670, ~L1270 | 1 | `_check_privacy_override()` + SHM frame substitution |
+| `frigate/pose_detection/privacy_renderer.py` | 1 | Skeleton rendering (YUV for SHM) |
+| `frigate/camera/__init__.py` | 1 | `privacy_override_until` shared mp.Value in CameraMetrics |
+| `frigate/track/pose_consumer.py` | 1+2+3 | Override trigger: sets SHM mp.Value + publishes MQTT |
+| `serai-edge-setup/privacy-proxy/privacy_proxy.py` | 2+3 | Sidecar: TCP server + go2rtc API + pre-event buffer |
+| `serai-edge-setup/privacy-proxy/skeleton_renderer.py` | 2 | Standalone skeleton renderer for proxy |
+
+---
+
 ## Notes for Contributors
 
 1. **COCO 17-keypoint layout is a hard constant** — do not make this user-configurable without updating all code paths

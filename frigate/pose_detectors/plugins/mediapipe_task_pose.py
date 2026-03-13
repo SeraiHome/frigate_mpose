@@ -118,17 +118,20 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
             from mediapipe.tasks import python
             from mediapipe.tasks.python import vision
 
-            # Store drawing utilities for visualization (optional, removed in newer mediapipe)
+            # Store drawing utilities for visualization (optional, not all builds have it)
             try:
                 self.mp_drawing = mp.solutions.drawing_utils
             except AttributeError:
-                logger.info("mp.solutions.drawing_utils not available in mediapipe %s, debug visualization will use cv2 fallback", getattr(mp, '__version__', 'unknown'))
                 self.mp_drawing = None
+                logger.info("mp.solutions.drawing_utils not available, debug visualization disabled")
 
-            # Import necessary classes for landmark conversion
-            from mediapipe.framework.formats import landmark_pb2
-
-            self.landmark_pb2 = landmark_pb2
+            # Import necessary classes for landmark conversion (optional, debug only)
+            try:
+                from mediapipe.framework.formats import landmark_pb2
+                self.landmark_pb2 = landmark_pb2
+            except ImportError:
+                self.landmark_pb2 = None
+                logger.info("mediapipe.framework not available, landmark proto conversion disabled")
 
             # Attempt to preload an EdgeTPU delegate if configured for this detector.
             # accel = getattr(detector_config, "accelerator", None)
@@ -305,7 +308,7 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
 
             # Save visualization if landmarks are detected and debug dir exists
             debug_dir = os.path.join(const.BASE_DIR, "debug")
-            if True:  # results.pose_landmarks and os.path.exists(debug_dir):
+            if self.landmark_pb2 and self.mp_drawing:  # results.pose_landmarks and os.path.exists(debug_dir):
                 try:
                     # Create a copy of the RGB image for visualization
                     vis_image = image_rgb.copy()
@@ -350,22 +353,10 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
                             (29, 31),
                             (30, 32),
                         ]
-                        if self.mp_drawing is not None:
+                        if self.mp_drawing:
                             self.mp_drawing.draw_landmarks(
                                 vis_image, landmark_list, connections
                             )
-                        else:
-                            # cv2 fallback: draw keypoints and connections directly
-                            h, w = vis_image.shape[:2]
-                            pts = {}
-                            for lm in landmark_list.landmark:
-                                idx = len(pts)
-                                px, py = int(lm.x * w), int(lm.y * h)
-                                pts[idx] = (px, py)
-                                cv2.circle(vis_image, (px, py), 3, (0, 255, 0), -1)
-                            for c_start, c_end in connections:
-                                if c_start in pts and c_end in pts:
-                                    cv2.line(vis_image, pts[c_start], pts[c_end], (0, 255, 0), 2)
 
                     # Convert RGB to BGR for OpenCV's imwrite
                     vis_image_bgr = cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR)

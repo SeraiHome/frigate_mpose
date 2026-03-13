@@ -1,0 +1,31 @@
+%%{init: {'theme': 'dark', 'themeVariables': {'primaryColor': '#1a1a2e', 'lineColor': '#e94560'}}}%%
+graph TD
+    CAM["Real Camera<br/>(iPhone RTSP)"]
+
+    CAM --> GO2RTC["go2rtc<br/>&quot;iphone_real&quot;<br/><i>real source, always available</i>"]
+
+    GO2RTC --> DETECT["Frigate DETECT<br/>reads iphone_real<br/>(real frames for ML)"]
+    GO2RTC --> PROXY["Privacy Proxy Sidecar"]
+
+    subgraph PROXY_DETAIL ["Privacy Proxy"]
+        direction TB
+        P1["1. MQTT keypoints → render<br/>skeleton BGR24 frames"]
+        P2["2. Serve over TCP :9000"]
+        P3["3. Pre-event JPEG buffer"]
+        P4["4. go2rtc API switching"]
+    end
+
+    PROXY --- PROXY_DETAIL
+
+    DETECT -->|"SHM substitution<br/>(skeleton YUV)"| SHM_OUTPUTS
+    PROXY -->|"TCP :9000<br/>raw BGR24 frames"| RECORD["Frigate RECORD<br/>reads TCP :9000"]
+    PROXY -->|"PUT /api/streams"| GO2RTC_API["go2rtc API<br/>stream switching"]
+
+    subgraph SHM_OUTPUTS ["SHM Consumers"]
+        WEBUI["Web UI"]
+        BIRDSEYE["Birdseye"]
+        SNAPSHOTS["Snapshots"]
+        JSMPEG["JSMPEG Live View"]
+    end
+
+    GO2RTC_API --> LIVEVIEW["Live View<br/>(WebRTC/MSE)<br/><i>switched on override</i>"]

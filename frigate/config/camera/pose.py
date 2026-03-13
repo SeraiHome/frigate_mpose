@@ -106,3 +106,44 @@ class PoseConfig(FrigateBaseModel):
             "processing pipeline instead."
         ),
     )
+    privacy_mode: bool = Field(
+        default=False,
+        title="Privacy mode: show skeleton instead of real camera in web UI and snapshots.",
+        description=(
+            "When enabled, frames in shared memory are replaced with skeleton "
+            "renderings after pose detection runs. This affects the web UI "
+            "(JSMPEG), birdseye, and snapshots. The detection pipeline always "
+            "sees real frames for ML accuracy."
+        ),
+    )
+    privacy_override_seconds: int = Field(
+        default=60,
+        title="Duration in seconds to show real frames after a privacy override trigger.",
+        description=(
+            "When an action in record_actions is detected and privacy_mode is "
+            "enabled, real camera frames are shown for this many seconds. "
+            "Applies to all three privacy layers: SHM (web UI/birdseye), "
+            "proxy TCP stream (recordings), and go2rtc live view (WebRTC/MSE)."
+        ),
+    )
+    privacy_background: str = Field(
+        default="black",
+        title="Background style for privacy mode skeleton rendering.",
+        description=(
+            "Controls the background behind the skeleton overlay. "
+            "'black' renders skeletons on a solid black canvas. "
+            "'scene' uses the motion detector's running average of the "
+            "static room background (grayscale), giving a natural empty-room "
+            "appearance with colored skeletons on top."
+        ),
+    )
+    publish_keypoints: bool = Field(
+        default=False,
+        title="Publish pose keypoints to MQTT for the privacy proxy sidecar.",
+        description=(
+            "When enabled, publishes COCO 17-keypoint coordinates to "
+            "frigate/{camera}/pose_keypoints via MQTT after each detection. "
+            "Used by the external privacy proxy to generate skeleton RTSP "
+            "streams for recording privacy."
+        ),
+    )

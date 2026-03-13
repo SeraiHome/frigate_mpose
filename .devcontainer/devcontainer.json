@@ -54,6 +54,12 @@
       "onAutoForward": "silent"
     }
   },
+  "postStartCommand": "bash .devcontainer/claude-persist.sh restore",
+  "postAttachCommand": "bash .devcontainer/claude-persist.sh save",
+  "remoteEnv": {
+    "DEVCONTAINER": "true",
+    "NODE_OPTIONS": "--max-old-space-size=4096"
+  },
   "customizations": {
     "vscode": {
       "extensions": [
@@ -74,7 +80,7 @@
         "eamodio.gitlens"
       ],
       "settings": {
-        "remote.autoForwardPorts": false,
+        "remote.autoForwardPorts": true,
         "python.formatting.provider": "none",
         "python.languageServer": "Pylance",
         "editor.formatOnPaste": false,

@@ -2,11 +2,14 @@ import json
 import logging
 import queue
 import threading
+import time
 from multiprocessing import Queue as MpQueue
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any, List, Optional
 
 import numpy as np
+
+from frigate.pose_detection.privacy_renderer import keypoints_to_mqtt_payload
 
 from frigate.camera.state import CameraState
 from frigate.comms.detections_updater import (
@@ -73,6 +76,7 @@ class PoseConsumer(threading.Thread):
         config: FrigateConfig,
         dispatcher: Dispatcher,
         stop_event: MpEvent,
+        camera_metrics: dict = None,
         ptz_autotracker_thread=None,
         detected_frames_queue: Optional[MpQueue] = None,
     ) -> None:
@@ -80,6 +84,7 @@ class PoseConsumer(threading.Thread):
         self.config = config
         self.dispatcher = dispatcher
         self.stop_event = stop_event
+        self.camera_metrics = camera_metrics or {}
         self.ptz_autotracker_thread = ptz_autotracker_thread
 
         self.frame_manager = SharedMemoryFrameManager()
@@ -91,6 +96,9 @@ class PoseConsumer(threading.Thread):
         # Optional queue to publish synthesized detected objects into the
         # existing object processing pipeline.
         self.detected_frames_queue = detected_frames_queue
+
+        # Track per-camera privacy override expiry to debounce triggers
+        self._privacy_override_until: dict[str, float] = {}
 
         # Subscribe to processed pose detections published by TrackedPoseProcessor
         self.detection_subscriber = DetectionSubscriber(DetectionTypeEnum.video.value)
@@ -370,6 +378,31 @@ class PoseConsumer(threading.Thread):
                         "Failed to publish pose detection via DetectionPublisher"
                     )
 
+                # Publish keypoints to MQTT for the privacy proxy sidecar
+                cam_config = self.config.cameras.get(camera)
+                if (
+                    cam_config
+                    and hasattr(cam_config, "pose")
+                    and cam_config.pose
+                    and cam_config.pose.publish_keypoints
+                    and tracked_poses
+                ):
+                    try:
+                        frame_w = cam_config.detect.width
+                        frame_h = cam_config.detect.height
+                        payload = keypoints_to_mqtt_payload(
+                            tracked_poses, frame_time, frame_w, frame_h
+                        )
+                        self.dispatcher.publish(
+                            f"{camera}/pose_keypoints",
+                            json.dumps(payload),
+                            retain=False,
+                        )
+                    except Exception:
+                        logger.debug(
+                            f"Failed to publish keypoints for {camera}"
+                        )
+
                 # Ensure the frame is available in the CameraState frame cache so
                 # snapshots/clips can be created even if the object pipeline ran earlier.
                 try:
@@ -557,6 +590,47 @@ class PoseConsumer(threading.Thread):
                                     ):
                                         matched_obj.has_clip = True
                                         matched_obj.obj_data["has_clip"] = True
+
+                                    # Trigger privacy override for sidecar
+                                    # (switches recording from skeleton to real frames)
+                                    # Debounce: only fire if not already overriding
+                                    now = time.time()
+                                    already_overriding = (
+                                        now
+                                        < self._privacy_override_until.get(camera, 0)
+                                    )
+                                    if (
+                                        not already_overriding
+                                        and cam_pose_cfg
+                                        and getattr(cam_pose_cfg, "privacy_mode", False)
+                                        and getattr(
+                                            cam_pose_cfg, "record_actions", None
+                                        )
+                                        and action in cam_pose_cfg.record_actions
+                                    ):
+                                        post_event_s = getattr(
+                                            cam_pose_cfg, "privacy_override_seconds", 60
+                                        )
+                                        override_until = now + post_event_s
+                                        self._privacy_override_until[camera] = (
+                                            override_until
+                                        )
+                                        # SHM override (web UI / birdseye) via shared mp.Value
+                                        cam_metrics = self.camera_metrics.get(camera)
+                                        if cam_metrics:
+                                            cam_metrics.privacy_override_until.value = override_until
+                                        # MQTT override (sidecar proxy)
+                                        self.dispatcher.publish(
+                                            f"{camera}/privacy_override",
+                                            json.dumps(
+                                                {"duration_seconds": post_event_s}
+                                            ),
+                                            retain=False,
+                                        )
+                                        logger.info(
+                                            f"Privacy override triggered for {camera} "
+                                            f"({post_event_s}s) due to '{action}'"
+                                        )
 
                                     # Ensure an alert severity exists so retention logic
                                     # that checks `max_severity` will consider this object

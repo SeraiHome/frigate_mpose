@@ -10,7 +10,8 @@
       "console": "integratedTerminal", // Add this
       "env": {
         "PYTHONUNBUFFERED": "1" // Add this
-      }
+      },
+      "preLaunchTask": "Kill stale FFmpeg processes"
     }
   ]
 }

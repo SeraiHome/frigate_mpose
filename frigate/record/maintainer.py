@@ -142,6 +142,13 @@ class RecordingMaintainer(threading.Thread):
                 grouped_recordings[camera], key=lambda s: s["start_time"]
             )
 
+            # When detect is disabled, all segments are "processed" immediately
+            # (no detection data to wait for), so skip the unprocessed check.
+            if not self.config.cameras[camera].detect.enabled:
+                if len(grouped_recordings[camera]) > keep_count:
+                    grouped_recordings[camera] = grouped_recordings[camera][-keep_count:]
+                continue
+
             camera_info = self.object_recordings_info[camera]
             most_recently_processed_frame_time = (
                 camera_info[-1][0] if len(camera_info) > 0 else 0
@@ -352,6 +359,18 @@ class RecordingMaintainer(threading.Thread):
                     self.drop_segment(cache_path)
         # continuous / motion is enabled
         else:
+            # If detect is disabled for this camera, we won't receive any
+            # detection data so move segments immediately with retain_all.
+            if not self.config.cameras[camera].detect.enabled:
+                return await self.move_segment(
+                    camera,
+                    start_time,
+                    end_time,
+                    duration,
+                    cache_path,
+                    RetainModeEnum.all,
+                )
+
             # assume that empty means the relevant recording info has not been received yet
             camera_info = self.object_recordings_info[camera]
             most_recently_processed_frame_time = (
