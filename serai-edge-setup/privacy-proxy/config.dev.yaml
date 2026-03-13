@@ -7,6 +7,9 @@ mqtt_port: 1883
 pre_event_seconds: 30
 post_event_seconds: 60
 
+# go2rtc API for live view stream switching during override
+go2rtc_api_url: http://frigate-devcontainer:1984
+
 cameras:
   - name: iphone
     width: 1280

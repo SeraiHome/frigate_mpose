@@ -15,6 +15,8 @@ import os
 import socket
 import threading
 import time
+import urllib.request
+import urllib.error
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -82,6 +84,9 @@ class PrivacyProxy:
         self.post_event_seconds = config.get("post_event_seconds", 60)
         self.recordings_dir = config.get("recordings_dir", "/media/frigate/recordings")
 
+        # go2rtc API for live view stream switching
+        self.go2rtc_api_url = config.get("go2rtc_api_url", "")
+
         # MQTT
         self.mqtt_host = config.get("mqtt_host", "localhost")
         self.mqtt_port = config.get("mqtt_port", 1883)
@@ -125,13 +130,56 @@ class PrivacyProxy:
             try:
                 data = json.loads(msg.payload)
                 duration = data.get("duration_seconds", self.post_event_seconds)
+                was_active = cam.is_override_active
                 cam.override_until = time.time() + duration
                 logger.warning(
                     f"Privacy override ACTIVATED for {cam_name} "
                     f"({duration}s, real frames)"
                 )
+                # Switch go2rtc live view to real camera
+                if not was_active:
+                    self._go2rtc_switch_to_real(cam)
             except json.JSONDecodeError:
                 pass
+
+    def _go2rtc_switch_to_real(self, cam: CameraState) -> None:
+        """Switch go2rtc live stream to real camera via API."""
+        if not self.go2rtc_api_url:
+            return
+        real_src = f"rtsp://127.0.0.1:8554/{cam.name}_real"
+        self._go2rtc_set_stream(cam.name, real_src)
+
+    def _go2rtc_switch_to_privacy(self, cam: CameraState) -> None:
+        """Switch go2rtc live stream back to privacy (dead URL → JSMPEG fallback)."""
+        if not self.go2rtc_api_url:
+            return
+        # Point to non-routable address so go2rtc fails to produce frames.
+        # Frigate's live view falls back to JSMPEG which reads SHM (skeletons).
+        self._go2rtc_set_stream(cam.name, "rtsp://0.0.0.0:0/privacy")
+
+    def _go2rtc_set_stream(self, stream_name: str, src: str) -> None:
+        """Update a go2rtc stream source via PUT /api/streams."""
+        url = (
+            f"{self.go2rtc_api_url}/api/streams"
+            f"?name={stream_name}&src={urllib.request.quote(src, safe='/:@')}"
+        )
+        try:
+            req = urllib.request.Request(url, method="PUT")
+            urllib.request.urlopen(req, timeout=5)
+            logger.info(f"go2rtc stream '{stream_name}' → {src}")
+        except Exception as e:
+            logger.warning(f"go2rtc API error setting '{stream_name}': {e}")
+
+    def _run_override_watchdog(self) -> None:
+        """Monitor override state and switch go2rtc back to privacy when expired."""
+        while True:
+            for cam in self.cameras.values():
+                if not cam.is_override_active and cam.override_until > 0:
+                    # Override just expired — switch live view back to privacy
+                    logger.info(f"Override expired for {cam.name}, restoring privacy stream")
+                    self._go2rtc_switch_to_privacy(cam)
+                    cam.override_until = 0.0  # Reset so we don't re-trigger
+            time.sleep(2)
 
     def _generate_frames(self, cam: CameraState):
         """Generator: yield BGR frames (skeleton or real) for a camera.
@@ -286,9 +334,13 @@ class PrivacyProxy:
                 time.sleep(5)
         self.mqtt_client.loop_start()
 
+        # Ensure go2rtc starts in privacy mode for all cameras
+        for cam in self.cameras.values():
+            self._go2rtc_switch_to_privacy(cam)
+
         threads = []
         for cam in self.cameras.values():
-            # TCP server thread (replaces FFmpeg RTSP push)
+            # TCP server thread (serves skeleton frames for recording)
             t = threading.Thread(
                 target=self._run_tcp_server,
                 args=(cam,),
@@ -307,6 +359,15 @@ class PrivacyProxy:
             )
             t2.start()
             threads.append(t2)
+
+        # Override watchdog: switches go2rtc back to privacy when override expires
+        t_watchdog = threading.Thread(
+            target=self._run_override_watchdog,
+            name="override-watchdog",
+            daemon=True,
+        )
+        t_watchdog.start()
+        threads.append(t_watchdog)
 
         logger.info(f"Privacy proxy running for {len(self.cameras)} cameras")
 
