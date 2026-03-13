@@ -116,6 +116,16 @@ class PoseConfig(FrigateBaseModel):
             "sees real frames for ML accuracy."
         ),
     )
+    privacy_override_seconds: int = Field(
+        default=60,
+        title="Duration in seconds to show real frames after a privacy override trigger.",
+        description=(
+            "When an action in record_actions is detected and privacy_mode is "
+            "enabled, real camera frames are shown for this many seconds. "
+            "Applies to all three privacy layers: SHM (web UI/birdseye), "
+            "proxy TCP stream (recordings), and go2rtc live view (WebRTC/MSE)."
+        ),
+    )
     privacy_background: str = Field(
         default="black",
         title="Background style for privacy mode skeleton rendering.",

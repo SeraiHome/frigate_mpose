@@ -606,7 +606,9 @@ class PoseConsumer(threading.Thread):
                                         )
                                         and action in cam_pose_cfg.record_actions
                                     ):
-                                        post_event_s = 60  # default
+                                        post_event_s = getattr(
+                                            cam_pose_cfg, "privacy_override_seconds", 60
+                                        )
                                         override_until = now + post_event_s
                                         self._privacy_override_until[camera] = (
                                             override_until
