@@ -512,30 +512,32 @@ class PoseConsumer(threading.Thread):
                         if not action or action == "standing":
                             continue
 
-                        # try to match to an existing tracked object by centroid distance
+                        # Try to match pose to an existing tracked person by IoU
                         matched_id = None
                         try:
-                            cx, cy = pd.get("centroid", (None, None))
-                            if cx is not None:
-                                min_dist = None
+                            pose_box = pd.get("box")
+                            if pose_box and len(pose_box) == 4:
+                                px1, py1, px2, py2 = pose_box
+                                best_iou = 0.3  # minimum IoU threshold
                                 for obj in camera_state.tracked_objects.values():
-                                    o_cx, o_cy = obj.obj_data.get(
-                                        "centroid", (None, None)
-                                    )
-                                    if o_cx is None:
+                                    if obj.obj_data.get("label") != "person":
                                         continue
-                                    dist = ((cx - o_cx) ** 2 + (cy - o_cy) ** 2) ** 0.5
-                                    if min_dist is None or dist < min_dist:
-                                        min_dist = dist
-                                        matched_id = obj.obj_data.get("id")
-                                # require match within a reasonable pixel threshold
-                                if min_dist is not None:
-                                    diag = (
-                                        camera_state.camera_config.detect.width**2
-                                        + camera_state.camera_config.detect.height**2
-                                    ) ** 0.5
-                                    if min_dist > 0.1 * diag:
-                                        matched_id = None
+                                    obj_box = obj.obj_data.get("box", [])
+                                    if len(obj_box) != 4:
+                                        continue
+                                    ox1, oy1, ox2, oy2 = obj_box
+                                    ix1 = max(px1, ox1)
+                                    iy1 = max(py1, oy1)
+                                    ix2 = min(px2, ox2)
+                                    iy2 = min(py2, oy2)
+                                    if ix2 > ix1 and iy2 > iy1:
+                                        intersection = (ix2 - ix1) * (iy2 - iy1)
+                                        pose_area = max(1, (px2 - px1) * (py2 - py1))
+                                        obj_area = max(1, (ox2 - ox1) * (oy2 - oy1))
+                                        iou = intersection / (pose_area + obj_area - intersection)
+                                        if iou > best_iou:
+                                            best_iou = iou
+                                            matched_id = obj.obj_data.get("id")
                         except Exception:
                             matched_id = None
 
