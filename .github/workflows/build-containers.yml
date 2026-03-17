@@ -41,14 +41,16 @@ jobs:
           docker system prune -af 2>/dev/null || true
           echo "Disk free: $(df -h / | tail -1 | awk '{print $4}')"
 
-      - name: Build frigate_mpose RPi image
+      - name: Generate version
+        run: echo 'VERSION = "0.17.0-'$(git log -1 --pretty=format:"%h")'"' > frigate/version.py
+
+      - name: Build frigate_mpose RPi image via buildx bake
         run: |
           TAG="${{ github.event.inputs.frigate_tag || 'latest' }}"
-          echo "Building frigate_mpose:${TAG}..."
-          docker build \
-            -f docker/rpi/Dockerfile \
-            -t ${{ env.FRIGATE_IMAGE }}:${TAG} \
-            .
+          echo "Building frigate_mpose:${TAG} via bake..."
+          docker buildx bake --file=docker/rpi/rpi.hcl rpi \
+            --set rpi.tags=${{ env.FRIGATE_IMAGE }}:${TAG} \
+            --load
           echo "Build complete: $(docker images ${{ env.FRIGATE_IMAGE }}:${TAG} --format '{{.Size}}')"
 
       - name: Push to GHCR
@@ -57,30 +59,5 @@ jobs:
           docker push ${{ env.FRIGATE_IMAGE }}:${TAG}
           echo "Pushed ${{ env.FRIGATE_IMAGE }}:${TAG}"
 
-  build-config-agent:
-    name: Build config-agent
-    runs-on: [self-hosted, arm64, serai-prod]
-    steps:
-      - name: Checkout edge-setup (config-agent source)
-        uses: actions/checkout@v4
-        with:
-          repository: SeraiHome/serai-edge-setup
-          ref: feat/remote-edge-access
-          token: ${{ secrets.GITHUB_TOKEN }}
-          path: edge-setup
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Build config-agent
-        run: |
-          TAG="${{ github.event.inputs.config_agent_tag || 'latest' }}"
-          cd edge-setup/config-agent
-          docker build -t ${{ env.CONFIG_AGENT_IMAGE }}:${TAG} .
-          echo "Build complete: $(docker images ${{ env.CONFIG_AGENT_IMAGE }}:${TAG} --format '{{.Size}}')"
-
-      - name: Push to GHCR
-        run: |
-          TAG="${{ github.event.inputs.config_agent_tag || 'latest' }}"
-          docker push ${{ env.CONFIG_AGENT_IMAGE }}:${TAG}
-          echo "Pushed ${{ env.CONFIG_AGENT_IMAGE }}:${TAG}"
+  # Config-agent is built from the serai-edge-setup repo.
+  # Trigger its build workflow separately, or build it in the EDI pipeline.
