@@ -1,0 +1,86 @@
+# Build Serai container images and push to GHCR
+# Runs on self-hosted prod ARM64 runner (3 OCPU, 18GB RAM)
+# Builds: frigate_mpose (RPi target) + config-agent
+
+name: Build Container Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      frigate_tag:
+        description: 'Frigate image tag'
+        required: false
+        default: 'latest'
+      config_agent_tag:
+        description: 'Config-agent image tag'
+        required: false
+        default: 'latest'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  FRIGATE_IMAGE: ghcr.io/seraihome/frigate_mpose
+  CONFIG_AGENT_IMAGE: ghcr.io/seraihome/config-agent
+
+jobs:
+  build-frigate:
+    name: Build frigate_mpose (RPi)
+    runs-on: [self-hosted, arm64, serai-prod]
+    steps:
+      - name: Checkout frigate_mpose
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Free disk space
+        run: |
+          docker system prune -af 2>/dev/null || true
+          echo "Disk free: $(df -h / | tail -1 | awk '{print $4}')"
+
+      - name: Build frigate_mpose RPi image
+        run: |
+          TAG="${{ github.event.inputs.frigate_tag || 'latest' }}"
+          echo "Building frigate_mpose:${TAG}..."
+          docker build \
+            -f docker/rpi/Dockerfile \
+            -t ${{ env.FRIGATE_IMAGE }}:${TAG} \
+            .
+          echo "Build complete: $(docker images ${{ env.FRIGATE_IMAGE }}:${TAG} --format '{{.Size}}')"
+
+      - name: Push to GHCR
+        run: |
+          TAG="${{ github.event.inputs.frigate_tag || 'latest' }}"
+          docker push ${{ env.FRIGATE_IMAGE }}:${TAG}
+          echo "Pushed ${{ env.FRIGATE_IMAGE }}:${TAG}"
+
+  build-config-agent:
+    name: Build config-agent
+    runs-on: [self-hosted, arm64, serai-prod]
+    steps:
+      - name: Checkout edge-setup (config-agent source)
+        uses: actions/checkout@v4
+        with:
+          repository: SeraiHome/serai-edge-setup
+          ref: feat/remote-edge-access
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: edge-setup
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build config-agent
+        run: |
+          TAG="${{ github.event.inputs.config_agent_tag || 'latest' }}"
+          cd edge-setup/config-agent
+          docker build -t ${{ env.CONFIG_AGENT_IMAGE }}:${TAG} .
+          echo "Build complete: $(docker images ${{ env.CONFIG_AGENT_IMAGE }}:${TAG} --format '{{.Size}}')"
+
+      - name: Push to GHCR
+        run: |
+          TAG="${{ github.event.inputs.config_agent_tag || 'latest' }}"
+          docker push ${{ env.CONFIG_AGENT_IMAGE }}:${TAG}
+          echo "Pushed ${{ env.CONFIG_AGENT_IMAGE }}:${TAG}"
