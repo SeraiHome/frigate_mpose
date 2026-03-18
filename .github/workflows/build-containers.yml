@@ -1,6 +1,6 @@
 # Build Serai container images and push to GHCR
 # Runs on self-hosted prod ARM64 runner (3 OCPU, 18GB RAM)
-# Builds: frigate_mpose (RPi target) + config-agent
+# Builds: frigate_mpose (RPi target) + privacy-proxy sidecar
 
 name: Build Container Images
 
@@ -11,8 +11,8 @@ on:
         description: 'Frigate image tag'
         required: false
         default: 'latest'
-      config_agent_tag:
-        description: 'Config-agent image tag'
+      privacy_proxy_tag:
+        description: 'Privacy proxy image tag'
         required: false
         default: 'latest'
 
@@ -23,7 +23,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   FRIGATE_IMAGE: ghcr.io/seraihome/frigate_mpose
-  CONFIG_AGENT_IMAGE: ghcr.io/seraihome/config-agent
+  PRIVACY_PROXY_IMAGE: ghcr.io/seraihome/privacy-proxy
 
 jobs:
   build-frigate:
@@ -53,11 +53,34 @@ jobs:
             --load
           echo "Build complete: $(docker images ${{ env.FRIGATE_IMAGE }}:${TAG} --format '{{.Size}}')"
 
-      - name: Push to GHCR
+      - name: Push frigate_mpose to GHCR
         run: |
           TAG="${{ github.event.inputs.frigate_tag || 'latest' }}"
           docker push ${{ env.FRIGATE_IMAGE }}:${TAG}
           echo "Pushed ${{ env.FRIGATE_IMAGE }}:${TAG}"
+
+  build-privacy-proxy:
+    name: Build privacy-proxy
+    runs-on: [self-hosted, arm64, serai-prod]
+    steps:
+      - name: Checkout frigate_mpose
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build privacy-proxy image
+        run: |
+          TAG="${{ github.event.inputs.privacy_proxy_tag || 'latest' }}"
+          echo "Building privacy-proxy:${TAG}..."
+          docker build -t ${{ env.PRIVACY_PROXY_IMAGE }}:${TAG} serai-edge-setup/privacy-proxy/
+          echo "Build complete: $(docker images ${{ env.PRIVACY_PROXY_IMAGE }}:${TAG} --format '{{.Size}}')"
+
+      - name: Push privacy-proxy to GHCR
+        run: |
+          TAG="${{ github.event.inputs.privacy_proxy_tag || 'latest' }}"
+          docker push ${{ env.PRIVACY_PROXY_IMAGE }}:${TAG}
+          echo "Pushed ${{ env.PRIVACY_PROXY_IMAGE }}:${TAG}"
 
   # Config-agent is built from the serai-edge-setup repo.
   # Trigger its build workflow separately, or build it in the EDI pipeline.
