@@ -84,3 +84,5 @@ soundfile==0.13.*
 degirum == 0.16.*
 # mediapipe
 mediapipe == 0.10.*
+# ST-GCN fall detection (pose activity detector)
+torch == 2.2.*
