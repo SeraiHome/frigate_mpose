@@ -105,47 +105,50 @@ class FFMpegConverter(threading.Thread):
             )
 
         try:
-            p = sp.run(
-                self.ffmpeg_cmd.split(" "),
-                input="\n".join(playlist),
-                encoding="ascii",
-                capture_output=True,
-            )
-        except BlockingIOError:
-            logger.warning(
-                f"Failed to create preview for {self.config.name}, retrying..."
-            )
-            time.sleep(2)
-            p = sp.run(
-                self.ffmpeg_cmd.split(" "),
-                input="\n".join(playlist),
-                encoding="ascii",
-                capture_output=True,
-            )
+            try:
+                p = sp.run(
+                    self.ffmpeg_cmd.split(" "),
+                    input="\n".join(playlist),
+                    encoding="ascii",
+                    capture_output=True,
+                )
+            except BlockingIOError:
+                logger.warning(
+                    f"Failed to create preview for {self.config.name}, retrying..."
+                )
+                time.sleep(2)
+                p = sp.run(
+                    self.ffmpeg_cmd.split(" "),
+                    input="\n".join(playlist),
+                    encoding="ascii",
+                    capture_output=True,
+                )
 
-        start = self.frame_times[0]
-        end = self.frame_times[-1]
+            start = self.frame_times[0]
+            end = self.frame_times[-1]
 
-        if p.returncode == 0:
-            logger.debug("successfully saved preview")
-            self.requestor.send_data(
-                INSERT_PREVIEW,
-                {
-                    Previews.id.name: f"{self.config.name}_{end}",
-                    Previews.camera.name: self.config.name,
-                    Previews.path.name: self.path,
-                    Previews.start_time.name: start,
-                    Previews.end_time.name: end,
-                    Previews.duration.name: end - start,
-                },
-            )
-        else:
-            logger.error(f"Error saving preview for {self.config.name} :: {p.stderr}")
-
-        # unlink files from cache
-        # don't delete last frame as it will be used as first frame in next segment
-        for t in self.frame_times[0:-1]:
-            Path(get_cache_image_name(self.config.name, t)).unlink(missing_ok=True)
+            if p.returncode == 0:
+                logger.debug("successfully saved preview")
+                self.requestor.send_data(
+                    INSERT_PREVIEW,
+                    {
+                        Previews.id.name: f"{self.config.name}_{end}",
+                        Previews.camera.name: self.config.name,
+                        Previews.path.name: self.path,
+                        Previews.start_time.name: start,
+                        Previews.end_time.name: end,
+                        Previews.duration.name: end - start,
+                    },
+                )
+            else:
+                logger.error(
+                    f"Error saving preview for {self.config.name} :: {p.stderr}"
+                )
+        finally:
+            # Always clean up cached frames regardless of conversion outcome.
+            # Don't delete last frame as it will be used as first frame in next segment.
+            for t in self.frame_times[0:-1]:
+                Path(get_cache_image_name(self.config.name, t)).unlink(missing_ok=True)
 
 
 class PreviewRecorder:

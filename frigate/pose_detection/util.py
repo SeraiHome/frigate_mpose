@@ -2,6 +2,13 @@ import numpy as np
 
 from frigate.pose_detectors.detector_config import InputTensorEnum
 
+from .tensor_utils import (
+    POSE_BBOX_END,
+    POSE_BBOX_START,
+    POSE_KEYPOINTS_END,
+    extract_keypoints_from_pose_output,
+)
+
 
 def tensor_transform(input_tensor: InputTensorEnum):
     """Convert tensor format enum to numpy transpose axes."""
@@ -15,14 +22,6 @@ def tensor_transform(input_tensor: InputTensorEnum):
         return (1, 2, 3, 0)
     else:
         return None
-
-
-from .tensor_utils import (
-    POSE_BBOX_END,
-    POSE_BBOX_START,
-    POSE_KEYPOINTS_END,
-    extract_keypoints_from_pose_output,
-)
 
 
 def format_pose_output(raw_poses, threshold=0.4):

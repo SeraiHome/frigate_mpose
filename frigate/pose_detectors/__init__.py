@@ -1,7 +1,15 @@
 import logging
 
-from .detector_config import InputTensorEnum, PoseModelConfig, PixelFormatEnum  # noqa: F401
-from .detector_types import PoseDetectorConfig, PoseDetectorTypeEnum, pose_api_types  # noqa: F401
+from .detector_config import (  # noqa: F401
+    InputTensorEnum,
+    PixelFormatEnum,
+    PoseModelConfig,
+)
+from .detector_types import (  # noqa: F401
+    PoseDetectorConfig,
+    PoseDetectorTypeEnum,
+    pose_api_types,
+)
 
 logger = logging.getLogger(__name__)
 

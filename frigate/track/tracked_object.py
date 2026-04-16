@@ -468,10 +468,15 @@ class TrackedObject:
                     else:
                         raw_frame = np.asarray(inner, dtype=np.uint8)
                 except Exception:
-                    logger.warning(
+                    logger.debug(
                         f"Unable to unwrap object-typed frame for {self.obj_data['id']}; type={type(raw_frame)}, shape={getattr(raw_frame, 'shape', None)}, dtype={getattr(raw_frame, 'dtype', None)}"
                     )
                     return None
+
+            # Skip conversion for frames without valid pixel data
+            # (e.g. pose-synthesized detections with no real frame)
+            if raw_frame.ndim < 2:
+                return None
 
             best_frame = cv2.cvtColor(raw_frame, cv2.COLOR_YUV2BGR_I420)
         except Exception as e:
@@ -520,6 +525,9 @@ class TrackedObject:
             return None
 
         try:
+            if raw_frame.ndim < 2:
+                return None
+
             best_frame = cv2.cvtColor(raw_frame, cv2.COLOR_YUV2BGR_I420)
         except Exception as e:
             logger.warning(
@@ -628,7 +636,7 @@ class TrackedObject:
             quality=snapshot_config.quality,
         )
         if jpg_bytes is None:
-            logger.warning(f"Unable to save snapshot for {self.obj_data['id']}.")
+            logger.debug(f"Unable to save snapshot for {self.obj_data['id']}.")
         else:
             with open(
                 os.path.join(
@@ -642,7 +650,7 @@ class TrackedObject:
         if snapshot_config.clean_copy:
             png_bytes = self.get_clean_png()
             if png_bytes is None:
-                logger.warning(
+                logger.debug(
                     f"Unable to save clean snapshot for {self.obj_data['id']}."
                 )
             else:

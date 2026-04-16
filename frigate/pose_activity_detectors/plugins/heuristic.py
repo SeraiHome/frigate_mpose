@@ -31,6 +31,9 @@ class HeuristicPoseDetector(PoseActivityDetector):
         body_height_threshold: int = 50,
         leg_spread_threshold: int = 100,
         confidence_threshold: float = 0.5,
+        fall_window_size: int = 10,
+        fall_vertical_drop_ratio: float = 0.25,
+        fall_hold_frames: int = 6,
         **kwargs,
     ):
         """
@@ -40,6 +43,11 @@ class HeuristicPoseDetector(PoseActivityDetector):
             body_height_threshold: Threshold for body height to detect lying pose (in pixels)
             leg_spread_threshold: Threshold for leg spread to detect walking (in pixels)
             confidence_threshold: Minimum confidence for keypoints to be considered valid
+            fall_window_size: Number of recent frames kept for fall detection
+            fall_vertical_drop_ratio: Minimum fraction of frame height the hip
+                must drop across the window to register a fall
+            fall_hold_frames: Number of subsequent frames to hold the 'falling'
+                label after a fall is first detected
             **kwargs: Additional keyword arguments
         """
         super().__init__(**kwargs)
@@ -50,21 +58,74 @@ class HeuristicPoseDetector(PoseActivityDetector):
             kwargs.get("confidence_threshold", confidence_threshold)
         )
         self.action_history = deque(maxlen=5)
+        # Per-track hip-y history, keyed by (camera, pose_id)
+        self._hip_y_history: dict = {}
+        # Per-track remaining hold frames after a fall fires
+        self._fall_hold: dict = {}
+        self.fall_window_size = int(fall_window_size)
+        self.fall_vertical_drop_ratio = float(fall_vertical_drop_ratio)
+        self.fall_hold_frames = int(fall_hold_frames)
         self.initialized = True
 
     def reset(self):
         """Reset the detector's internal state."""
         self.action_history.clear()
+        self._hip_y_history.clear()
+        self._fall_hold.clear()
+
+    def forget(self, pose_id: str, camera=None) -> None:
+        """Drop per-track state when a track expires."""
+        key = (camera, pose_id)
+        self._hip_y_history.pop(key, None)
+        self._fall_hold.pop(key, None)
+
+    def _check_fall(
+        self,
+        key: tuple,
+        hip_y: float,
+        frame_height: int,
+    ) -> bool:
+        """Simple vertical-drop fall heuristic.
+
+        Maintains a per-track sliding window of hip midpoint Y coordinates and
+        fires when the hip drops by more than `fall_vertical_drop_ratio` of
+        frame height across the window. This is a deliberately modest reference
+        implementation — a joint-angle + velocity rule is enough to show the
+        plugin interface working on synthetic and clean lab footage, but real
+        deployments will want a proper classifier plugged in via the same
+        `PoseActivityDetector` contract.
+        """
+        if frame_height is None or frame_height <= 0:
+            return False
+
+        history = self._hip_y_history.setdefault(
+            key, deque(maxlen=self.fall_window_size)
+        )
+        history.append(hip_y)
+
+        if len(history) < self.fall_window_size:
+            return False
+
+        drop = history[-1] - history[0]
+        return drop >= (self.fall_vertical_drop_ratio * frame_height)
 
     def detect(
-        self, keypoints: np.ndarray, **kwargs
+        self,
+        keypoints: np.ndarray,
+        frame_width=None,
+        frame_height=None,
+        pose_id=None,
+        camera=None,
+        **kwargs,
     ) -> Tuple[PoseActionTypeEnum, float]:
         """
         Detect the pose activity using heuristics.
 
         Args:
             keypoints: NumPy array of shape (num_points, 3) where each row is [x, y, confidence]
-            **kwargs: Additional arguments (frame_width, frame_height) - ignored by heuristic detector
+            frame_width/frame_height: Frame dimensions used by the fall heuristic
+            pose_id: Stable track id used for per-track state keying
+            camera: Camera name used for per-track state keying
 
         Returns:
             Tuple of (action_type, confidence)
@@ -108,6 +169,23 @@ class HeuristicPoseDetector(PoseActivityDetector):
 
             # Body height (shoulder to hip distance)
             body_height = abs(shoulder_midpoint[1] - hip_midpoint[1])
+
+            track_key = (camera, pose_id)
+
+            # Fall detection: vertical hip drop over a short window.
+            # Fires once and then holds the 'falling' label for a few frames
+            # so downstream consumers have time to observe the event.
+            fall_fired = self._check_fall(
+                track_key, float(hip_midpoint[1]), frame_height
+            )
+            hold_remaining = self._fall_hold.get(track_key, 0)
+            if fall_fired:
+                hold_remaining = max(hold_remaining, self.fall_hold_frames)
+                self._fall_hold[track_key] = hold_remaining
+
+            if hold_remaining > 0:
+                self._fall_hold[track_key] = hold_remaining - 1
+                return PoseActionTypeEnum.falling, 0.8
 
             # Analyze pose based on body posture
             if body_height < self.body_height_threshold:  # Very low body height

@@ -80,6 +80,7 @@ class Dispatcher:
             "review_detections": self._on_detections_command,
             "object_descriptions": self._on_object_description_command,
             "review_descriptions": self._on_review_description_command,
+            "pose": self._on_pose_command,
         }
         self._global_settings_handlers: dict[str, Callable] = {
             "notifications": self._on_global_notification_command,
@@ -356,6 +357,37 @@ class Dispatcher:
             detect_settings,
         )
         self.publish(f"{camera_name}/detect/state", payload, retain=True)
+
+    def _on_pose_command(self, camera_name: str, payload: str) -> None:
+        """Callback for pose topic — toggle pose detection on/off at runtime.
+
+        MQTT topic: frigate/{camera_name}/pose/set  (payload: ON or OFF)
+        State published to: frigate/{camera_name}/pose/state
+
+        Note: This controls pose detection only. Camera feed privacy
+        (stopping/starting feeds) is handled separately via go2rtc.
+        """
+        camera_config = self.config.cameras.get(camera_name)
+        if not camera_config or not hasattr(camera_config, "pose"):
+            logger.warning(f"Pose config not found for camera {camera_name}")
+            return
+
+        pose_settings = camera_config.pose
+
+        if payload == "ON":
+            if not pose_settings.enabled:
+                logger.info(f"Turning on pose detection for {camera_name}")
+                pose_settings.enabled = True
+        elif payload == "OFF":
+            if pose_settings.enabled:
+                logger.info(f"Turning off pose detection for {camera_name}")
+                pose_settings.enabled = False
+
+        self.config_updater.publish_update(
+            CameraConfigUpdateTopic(CameraConfigUpdateEnum.pose, camera_name),
+            pose_settings,
+        )
+        self.publish(f"{camera_name}/pose/state", payload, retain=True)
 
     def _on_enabled_command(self, camera_name: str, payload: str) -> None:
         """Callback for camera topic."""

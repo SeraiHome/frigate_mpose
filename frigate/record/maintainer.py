@@ -146,7 +146,9 @@ class RecordingMaintainer(threading.Thread):
             # (no detection data to wait for), so skip the unprocessed check.
             if not self.config.cameras[camera].detect.enabled:
                 if len(grouped_recordings[camera]) > keep_count:
-                    grouped_recordings[camera] = grouped_recordings[camera][-keep_count:]
+                    grouped_recordings[camera] = grouped_recordings[camera][
+                        -keep_count:
+                    ]
                 continue
 
             camera_info = self.object_recordings_info[camera]
@@ -157,8 +159,10 @@ class RecordingMaintainer(threading.Thread):
             processed_segment_count = len(
                 list(
                     filter(
-                        lambda r: r["start_time"].timestamp()
-                        < most_recently_processed_frame_time,
+                        lambda r: (
+                            r["start_time"].timestamp()
+                            < most_recently_processed_frame_time
+                        ),
                         grouped_recordings[camera],
                     )
                 )

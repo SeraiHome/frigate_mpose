@@ -87,9 +87,13 @@ class StatsEmitter(threading.Thread):
                 break
 
             logger.debug("Starting stats collection")
-            stats = stats_snapshot(
-                self.config, self.stats_tracking, self.hwaccel_errors
-            )
+            try:
+                stats = stats_snapshot(
+                    self.config, self.stats_tracking, self.hwaccel_errors
+                )
+            except FileNotFoundError:
+                logger.warning("Stats collection failed — manager may be shutting down")
+                continue
             self.stats_history.append(stats)
             self.stats_history = self.stats_history[-MAX_STATS_POINTS:]
 

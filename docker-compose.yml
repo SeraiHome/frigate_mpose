@@ -52,17 +52,6 @@ services:
     command: mosquitto -c /mosquitto-no-auth.conf # enable no-auth mode
     ports:
       - "1893:1883" #offset to avoid conflict with host mqtt broker
-  privacy-proxy:
-    container_name: privacy-proxy
-    build: ./serai-edge-setup/privacy-proxy
-    restart: unless-stopped
-    volumes:
-      - ./serai-edge-setup/privacy-proxy/config.dev.yaml:/config/config.yaml:ro
-      - ./debug:/media/frigate   # For pre-event buffer writes
-    depends_on:
-      - mqtt
-    # Dev: use default bridge network so container names resolve
-    # Prod: use network_mode: host
 
 volumes:
   claude-data: # Named volume to persist Claude auth & history across rebuilds

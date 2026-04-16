@@ -19,7 +19,6 @@ class CameraMetrics:
     process_pid: Synchronized
     capture_process_pid: Synchronized
     ffmpeg_pid: Synchronized
-    privacy_override_until: Synchronized  # timestamp until which real frames are shown
 
     def __init__(self, manager: SyncManager):
         self.camera_fps = manager.Value("d", 0)
@@ -36,7 +35,6 @@ class CameraMetrics:
         self.process_pid = manager.Value("i", 0)
         self.capture_process_pid = manager.Value("i", 0)
         self.ffmpeg_pid = manager.Value("i", 0)
-        self.privacy_override_until = manager.Value("d", 0.0)
 
 
 class PTZMetrics:

@@ -2,13 +2,13 @@ import logging
 import os
 import shutil
 import subprocess
-import tempfile
 import urllib.request
 
 import cv2
 import numpy as np
 
 import frigate.const as const
+from frigate.const import MODEL_CACHE_DIR
 from frigate.pose_detection.tensor_utils import (
     create_pose_output,
     create_pose_output_batch,
@@ -37,11 +37,9 @@ MP_DEFAULT_PATH = (
     "/usr/local/lib/python3.11/dist-packages/mediapipe/modules/pose_landmark/"
 )
 
-# Create a writable directory for MediaPipe models
+# Use persistent model cache directory (consistent with other models in the codebase)
+MEDIAPIPE_MODEL_DIR = os.path.join(MODEL_CACHE_DIR, "mediapipe")
 try:
-    MEDIAPIPE_MODEL_DIR = os.path.join(
-        tempfile.gettempdir(), "frigate_mediapipe_models"
-    )
     os.makedirs(MEDIAPIPE_MODEL_DIR, exist_ok=True)
 
     # Set environment variable for MediaPipe models
@@ -49,7 +47,7 @@ try:
     logger.info(f"Set MediaPipe model directory to {MEDIAPIPE_MODEL_DIR}")
 except Exception as e:
     logger.warning(f"Failed to create MediaPipe model directory: {e}")
-    MEDIAPIPE_MODEL_DIR = tempfile.gettempdir()
+    MEDIAPIPE_MODEL_DIR = MODEL_CACHE_DIR
 
 
 # Function to pre-download a model to our custom directory

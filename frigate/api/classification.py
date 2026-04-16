@@ -47,7 +47,7 @@ def get_faces():
         face_dict[name] = []
 
         for file in filter(
-            lambda f: (f.lower().endswith((".webp", ".png", ".jpg", ".jpeg"))),
+            lambda f: f.lower().endswith((".webp", ".png", ".jpg", ".jpeg")),
             os.listdir(face_dir),
         ):
             face_dict[name].append(file)
@@ -466,7 +466,7 @@ def get_classification_dataset(name: str):
         dataset_dict[name] = []
 
         for file in filter(
-            lambda f: (f.lower().endswith((".webp", ".png", ".jpg", ".jpeg"))),
+            lambda f: f.lower().endswith((".webp", ".png", ".jpg", ".jpeg")),
             os.listdir(category_dir),
         ):
             dataset_dict[name].append(file)
@@ -485,7 +485,7 @@ def get_classification_images(name: str):
         status_code=200,
         content=list(
             filter(
-                lambda f: (f.lower().endswith((".webp", ".png", ".jpg", ".jpeg"))),
+                lambda f: f.lower().endswith((".webp", ".png", ".jpg", ".jpeg")),
                 os.listdir(train_dir),
             )
         ),

@@ -1,7 +1,9 @@
 import datetime
+import glob
 import logging
 import os
 import queue
+import shutil
 import subprocess as sp
 import threading
 import time
@@ -30,10 +32,6 @@ from frigate.motion import MotionDetector
 from frigate.motion.improved_motion import ImprovedMotionDetector
 from frigate.object_detection.base import RemoteObjectDetector
 from frigate.pose_detection.integration import PoseDetectionIntegration
-from frigate.pose_detection.privacy_renderer import (
-    render_skeleton_yuv,
-    render_no_detection_yuv,
-)
 from frigate.ptz.autotrack import ptz_moving_at_frame_time
 from frigate.track import ObjectTracker
 from frigate.track.norfair_tracker import NorfairTracker
@@ -59,6 +57,39 @@ from frigate.util.object import (
 from frigate.util.process import FrigateProcess
 
 logger = logging.getLogger(__name__)
+
+
+def cache_has_space(min_percent: float = 10.0) -> bool:
+    """Check if CACHE_DIR has at least min_percent free space."""
+    try:
+        usage = shutil.disk_usage(CACHE_DIR)
+        return (usage.free / usage.total) * 100 > min_percent
+    except OSError:
+        return True  # if we can't check, don't block restart
+
+
+def _emergency_cache_cleanup() -> None:
+    """Delete stale preview frames and oldest segment files from cache when disk is full."""
+    # Remove webp preview frames older than 30 minutes
+    threshold = time.time() - 30 * 60
+    preview_dir = os.path.join(CACHE_DIR, "preview_frames")
+    if os.path.isdir(preview_dir):
+        for f in glob.glob(os.path.join(preview_dir, "*.webp")):
+            try:
+                if os.path.getmtime(f) < threshold:
+                    os.unlink(f)
+            except OSError:
+                pass
+    # Remove oldest mp4 segments, keeping only the 4 newest
+    segments = sorted(
+        glob.glob(os.path.join(CACHE_DIR, "*.mp4")),
+        key=os.path.getmtime,
+    )
+    for f in segments[:-4]:
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
 
 
 def stop_ffmpeg(ffmpeg_process: sp.Popen[Any], logger: logging.Logger):
@@ -127,45 +158,53 @@ def capture_frames(
         config_subscriber.check_for_updates()
         return config.enabled
 
-    while not stop_event.is_set():
-        if not get_enabled_state():
-            logger.debug(f"Stopping capture thread for disabled {config.name}")
-            break
-
-        fps.value = frame_rate.eps()
-        skipped_fps.value = skipped_eps.eps()
-        current_frame.value = datetime.datetime.now().timestamp()
-        frame_name = f"{config.name}_frame{frame_index}"
-        frame_buffer = frame_manager.write(frame_name)
-        try:
-            frame_buffer[:] = ffmpeg_process.stdout.read(frame_size)
-        except Exception:
-            # shutdown has been initiated
-            if stop_event.is_set():
+    try:
+        while not stop_event.is_set():
+            if not get_enabled_state():
+                logger.debug(f"Stopping capture thread for disabled {config.name}")
                 break
 
-            logger.error(f"{config.name}: Unable to read frames from ffmpeg process.")
+            fps.value = frame_rate.eps()
+            skipped_fps.value = skipped_eps.eps()
+            current_frame.value = datetime.datetime.now().timestamp()
+            frame_name = f"{config.name}_frame{frame_index}"
+            frame_buffer = frame_manager.write(frame_name)
+            try:
+                frame_buffer[:] = ffmpeg_process.stdout.read(frame_size)
+            except Exception:
+                # shutdown has been initiated
+                if stop_event.is_set():
+                    break
 
-            if ffmpeg_process.poll() is not None:
                 logger.error(
-                    f"{config.name}: ffmpeg process is not running. exiting capture thread..."
+                    f"{config.name}: Unable to read frames from ffmpeg process."
                 )
-                break
 
-            continue
+                if ffmpeg_process.poll() is not None:
+                    logger.error(
+                        f"{config.name}: ffmpeg process is not running. exiting capture thread..."
+                    )
+                    break
 
-        frame_rate.update()
+                continue
 
-        # don't lock the queue to check, just try since it should rarely be full
-        try:
-            # add to the queue
-            frame_queue.put((frame_name, current_frame.value), False)
-            frame_manager.close(frame_name)
-        except queue.Full:
-            # if the queue is full, skip this frame
-            skipped_eps.update()
+            frame_rate.update()
 
-        frame_index = 0 if frame_index == shm_frame_count - 1 else frame_index + 1
+            # don't lock the queue to check, just try since it should rarely be full
+            try:
+                # add to the queue
+                frame_queue.put((frame_name, current_frame.value), False)
+                frame_manager.close(frame_name)
+            except queue.Full:
+                # if the queue is full, skip this frame
+                skipped_eps.update()
+
+            frame_index = 0 if frame_index == shm_frame_count - 1 else frame_index + 1
+    finally:
+        # Clean up ZMQ subscriber to prevent file descriptor leak.
+        # Each capture thread creates a ZMQ context+socket; without this,
+        # ffmpeg restarts accumulate orphaned sockets until EMFILE.
+        config_subscriber.stop()
 
 
 class CameraWatchdog(threading.Thread):
@@ -194,6 +233,7 @@ class CameraWatchdog(threading.Thread):
         self.frame_shape = self.config.frame_shape_yuv
         self.frame_size = self.frame_shape[0] * self.frame_shape[1]
         self.fps_overflow_count = 0
+        self.consecutive_failures = 0
         self.frame_index = 0
         self.stop_event = stop_event
         self.sleeptime = self.config.ffmpeg.retry_interval
@@ -234,6 +274,13 @@ class CameraWatchdog(threading.Thread):
             "The following ffmpeg logs include the last 100 lines prior to exit."
         )
         self.logpipe.dump()
+
+        if not cache_has_space():
+            self.logger.error(
+                f"{CACHE_DIR} is nearly full. Running emergency cleanup before restart."
+            )
+            _emergency_cache_cleanup()
+
         self.logger.info("Restarting ffmpeg...")
         self.start_ffmpeg_detect()
 
@@ -270,9 +317,16 @@ class CameraWatchdog(threading.Thread):
             if not self.capture_thread.is_alive():
                 self.requestor.send_data(f"{self.config.name}/status/detect", "offline")
                 self.camera_fps.value = 0
-                self.logger.error(
-                    f"Ffmpeg process crashed unexpectedly for {self.config.name}."
+                self.consecutive_failures += 1
+                backoff = min(
+                    self.sleeptime * (2 ** (self.consecutive_failures - 1)), 300
                 )
+                self.logger.error(
+                    f"Ffmpeg process crashed unexpectedly for {self.config.name}. "
+                    f"Restart attempt {self.consecutive_failures}, backoff {backoff:.0f}s."
+                )
+                if backoff > self.sleeptime:
+                    time.sleep(backoff - self.sleeptime)
                 self.reset_capture_thread(terminate=False)
             elif self.camera_fps.value >= (self.config.detect.fps + 10):
                 self.fps_overflow_count += 1
@@ -298,6 +352,7 @@ class CameraWatchdog(threading.Thread):
                 # process is running normally
                 self.requestor.send_data(f"{self.config.name}/status/detect", "online")
                 self.fps_overflow_count = 0
+                self.consecutive_failures = 0
 
             for p in self.ffmpeg_other_processes:
                 poll = p["process"].poll()
@@ -664,15 +719,6 @@ def detect(
             continue
         detections.append(det)
     return detections
-
-
-def _check_privacy_override(frame_time: float, camera_metrics: "CameraMetrics") -> bool:
-    """Check if privacy override is active (real frames requested during event).
-
-    Uses the shared multiprocessing Value in CameraMetrics so the override
-    set by pose_consumer (main process) is visible in the camera subprocess.
-    """
-    return frame_time < camera_metrics.privacy_override_until.value
 
 
 def process_frames(
@@ -1096,16 +1142,112 @@ def process_frames(
                     frame, frame_time, motion_boxes, regions
                 )
 
-            # When object detection is disabled but pose detection found people,
-            # inject pose detections directly into the object tracker so they
-            # become tracked objects that can receive action sub-labels
+            # When object detection is disabled but pose detection found
+            # people, inject pose detections into the object tracker and
+            # the detections dict so they flow to object_processing →
+            # CameraState → review pipeline.
+            #
+            # IMPORTANT: Actions (e.g. "falling") are determined
+            # ASYNCHRONOUSLY by the activity detector in pose_consumer,
+            # NOT here.  video.py only sees raw pose keypoints.
+            # pose_consumer enriches tracked objects with actions later
+            # and controls which actions create alerts via the configured
+            # actions/snapshot_actions/record_actions lists.
+            #
+            # detect_persons (default true): inject all poses as "person"
+            # detections routed through object_tracker.match_and_update.
+            # When false, inject them directly into the detections dict
+            # with stable pose_track ids so object_processing still sees
+            # continuous presence (one push per frame). Without this,
+            # pose-only cameras would push empty detection dicts every
+            # frame, racing with pose_consumer's own push and producing a
+            # high-rate create/update/end cycle on frigate/events MQTT.
             if not camera_config.detect.enabled and pose_enabled and tracked_poses:
-                # Build pose detections from the tracked_poses list directly
-                # This ensures we process poses even if publish_to_detected_objects is false
-                pose_based_detections = []
-                pose_det_map = {}  # Map from box to full detection dict
+                detect_persons = getattr(camera_config.pose, "detect_persons", True)
 
-                for pose in tracked_poses:
+                # Direct-injection branch for detect_persons=false: skip the
+                # object_tracker round-trip (which would treat poses as
+                # tracked persons and is exactly what detect_persons=false
+                # was added to avoid). Inject each tracked pose as a
+                # stable-id entry keyed on `pose_{pose_id}` with
+                # false_positive=False so object_processing's update
+                # callback fires type="new" once then type="update" on
+                # subsequent frames. pose_consumer asynchronously attaches
+                # the action sub_label when the activity classifier produces
+                # an action label for the track.
+                if not detect_persons:
+                    for pose in tracked_poses:
+                        if not pose.bbox or len(pose.bbox) != 4:
+                            continue
+                        try:
+                            x, y, w, h = [int(v) for v in pose.bbox]
+                            box = (x, y, x + w, y + h)
+                        except Exception:
+                            continue
+
+                        width = max(1, box[2] - box[0])
+                        height = max(1, box[3] - box[1])
+                        area = width * height
+                        ratio = float(width) / float(height)
+                        region = (
+                            0,
+                            0,
+                            int(frame_shape[0] * 3 // 2),
+                            int(frame_shape[1]),
+                        )
+                        pose_confidence = float(getattr(pose, "confidence", 0.0) or 0.0)
+                        score = max(pose_confidence, 0.7)
+                        # Use the raw pose_id so it matches what
+                        # pose_consumer's IoU match code, the
+                        # red-border-clear fix in _check_pose_event_timeouts,
+                        # and downstream integrations all key on.
+                        stable_id = pose.pose_id or f"pose_{frame_time}"
+
+                        # Intentionally OMIT `sub_label`, `action`, and
+                        # `action_confidence` from this dict.
+                        #
+                        # Why: the activity classifier runs in a different
+                        # process (TrackedPoseProcessor in the main frigate
+                        # process), so `pose.action` here (camera process)
+                        # is always the default "standing" -- never
+                        # reflects the classifier's current verdict.
+                        # pose_consumer (also in the main process)
+                        # mutates the matched tracked_object's obj_data
+                        # directly with the real (action, confidence)
+                        # tuple. TrackedObject.update() at line 372 calls
+                        # `self.obj_data.update(obj_data)`; only keys
+                        # PRESENT in obj_data are overwritten, so by
+                        # omitting these fields here we let pose_consumer
+                        # be the sole writer for them. The next MQTT
+                        # update callback fires with the correct sub_label.
+                        detections[stable_id] = {
+                            "id": stable_id,
+                            "label": "person",
+                            "false_positive": False,
+                            "score": score,
+                            "box": list(box),
+                            "area": area,
+                            "ratio": ratio,
+                            "region": region,
+                            "frame_time": frame_time,
+                            "centroid": (
+                                (box[0] + box[2]) // 2,
+                                (box[1] + box[3]) // 2,
+                            ),
+                            "estimate": box,
+                            "estimate_velocity": (0, 0),
+                            "start_time": frame_time,
+                            "motionless_count": 0,
+                            "position_changes": 1,
+                            "stationary": False,
+                            "attributes": [],
+                            "score_history": [score],
+                        }
+
+                pose_based_detections = []
+                pose_det_map = {}
+
+                for pose in tracked_poses if detect_persons else []:
                     if not pose.bbox or len(pose.bbox) != 4:
                         continue
                     try:
@@ -1119,35 +1261,25 @@ def process_frames(
                     area = width * height
                     ratio = float(width) / float(height)
                     region = (0, 0, int(frame_shape[0] * 3 // 2), int(frame_shape[1]))
-                    score = float(getattr(pose, "confidence", 0.0) or 0.0)
+                    pose_confidence = float(getattr(pose, "confidence", 0.0) or 0.0)
+                    # Upstream Frigate marks detections with score below
+                    # objects.filters.person.threshold (default 0.7) as
+                    # false_positive.  Pose detector confidence is often
+                    # lower, so floor the score at the threshold to ensure
+                    # pose-based persons are treated as true positives.
+                    score = max(pose_confidence, 0.7)
 
                     pose_based_detections.append(
                         ("person", score, box, area, ratio, region)
                     )
 
-                    # Build full detection dict for later merging
-                    if hasattr(pose, "action"):
-                        a = pose.action
-                        action_label = a.value if hasattr(a, "value") else str(a)
-                    else:
-                        action_label = None
-
+                    # sub_label is None here — the activity detector in
+                    # pose_consumer will set it asynchronously when an
+                    # action (e.g. "falling") is classified.
                     pose_det_map[box] = {
                         "id": f"pose_{pose.pose_id}",
                         "label": "person",
-                        "sub_label": (
-                            action_label,
-                            float(
-                                getattr(
-                                    pose,
-                                    "action_confidence",
-                                    getattr(pose, "confidence", 0.0),
-                                )
-                                or 0.0
-                            ),
-                        )
-                        if action_label
-                        else None,
+                        "sub_label": None,
                         "score": score,
                         "box": list(box),
                         "area": area,
@@ -1159,7 +1291,7 @@ def process_frames(
                         "estimate_velocity": (0, 0),
                         "start_time": frame_time,
                         "motionless_count": 0,
-                        "position_changes": 0,
+                        "position_changes": 1,
                         "stationary": False,
                         "attributes": [],
                         "score_history": [score],
@@ -1170,16 +1302,11 @@ def process_frames(
                         frame_name, frame_time, pose_based_detections
                     )
 
-                    # After tracker processes poses, build detections dict from tracker
-                    # with pose-specific data (sub_label, action, etc.) preserved.
-                    # Only include objects that were updated THIS frame to avoid duplicates.
                     for obj in object_tracker.tracked_objects.values():
-                        # Skip objects not updated this frame
                         if obj.get("frame_time") != frame_time:
                             continue
 
                         obj_box = tuple(obj["box"])
-                        # Find matching pose detection by IoU
                         for pose_box, pose_det in pose_det_map.items():
                             ix1 = max(obj_box[0], pose_box[0])
                             iy1 = max(obj_box[1], pose_box[1])
@@ -1187,13 +1314,20 @@ def process_frames(
                             iy2 = min(obj_box[3], pose_box[3])
                             if ix2 > ix1 and iy2 > iy1:
                                 inter = (ix2 - ix1) * (iy2 - iy1)
-                                oa = max(1, (obj_box[2] - obj_box[0]) * (obj_box[3] - obj_box[1]))
-                                pa = max(1, (pose_box[2] - pose_box[0]) * (pose_box[3] - pose_box[1]))
+                                oa = max(
+                                    1,
+                                    (obj_box[2] - obj_box[0])
+                                    * (obj_box[3] - obj_box[1]),
+                                )
+                                pa = max(
+                                    1,
+                                    (pose_box[2] - pose_box[0])
+                                    * (pose_box[3] - pose_box[1]),
+                                )
                                 iou = inter / (oa + pa - inter)
                             else:
                                 iou = 0.0
                             if iou > 0.3:
-                                # Merge tracker's ID/timing with pose data
                                 pose_det["id"] = obj["id"]
                                 pose_det["start_time"] = obj.get(
                                     "start_time", frame_time
@@ -1201,45 +1335,12 @@ def process_frames(
                                 pose_det["motionless_count"] = obj.get(
                                     "motionless_count", 0
                                 )
-                                pose_det["position_changes"] = obj.get(
-                                    "position_changes", 0
+                                pose_det["position_changes"] = max(
+                                    obj.get("position_changes", 0),
+                                    pose_det.get("position_changes", 0),
                                 )
                                 detections[obj["id"]] = pose_det
                                 break
-
-            # --- PRIVACY MODE: Replace SHM frame with skeleton render ---
-            # All detection/tracking has run on real frames above. Now swap the
-            # SHM contents so downstream consumers (web UI, JSMPEG, birdseye,
-            # snapshots) see skeletons instead of real camera footage.
-            if (
-                pose_enabled
-                and camera_config.pose.privacy_mode
-                and not _check_privacy_override(frame_time, camera_metrics)
-            ):
-                # Get background image from motion detector if "scene" mode
-                privacy_bg = None
-                if camera_config.pose.privacy_background == "scene":
-                    privacy_bg = motion_detector.avg_frame
-
-                if tracked_poses:
-                    skeleton_frame = render_skeleton_yuv(
-                        tracked_poses,
-                        (frame_shape[0], frame_shape[1]),
-                        bg_image=privacy_bg,
-                    )
-                else:
-                    skeleton_frame = render_no_detection_yuv(
-                        (frame_shape[0], frame_shape[1]),
-                        bg_image=privacy_bg,
-                    )
-
-                # Overwrite the frame in shared memory
-                current_frame = frame_manager.get(
-                    frame_name, (frame_shape[0] * 3 // 2, frame_shape[1])
-                )
-                if current_frame is not None:
-                    current_frame[:] = skeleton_frame
-            # --- END PRIVACY MODE ---
 
             detected_objects_queue.put(
                 (

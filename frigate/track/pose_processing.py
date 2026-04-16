@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import queue
@@ -6,7 +7,10 @@ from collections import defaultdict
 from enum import Enum
 from multiprocessing import Queue as MpQueue
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from frigate.pose_activity_detectors.pool import PoseActivityPool
 
 import cv2
 
@@ -21,7 +25,11 @@ from frigate.config.camera.updater import (
     CameraConfigUpdateSubscriber,
 )
 from frigate.const import FAST_QUEUE_TIMEOUT
-from frigate.events.pose_types import PoseEventStateEnum, PoseEventTypeEnum
+from frigate.events.pose_types import (
+    PoseActionTypeEnum,
+    PoseEventStateEnum,
+    PoseEventTypeEnum,
+)
 from frigate.pose_activity_detectors import create_activity_detector
 from frigate.pose_activity_detectors.base import PoseActivityDetector
 from frigate.pose_activity_detectors.detector_config import create_detector_config
@@ -52,6 +60,7 @@ class TrackedPoseProcessor(threading.Thread):
         tracked_poses_queue: MpQueue,
         stop_event: MpEvent,
         ptz_autotracker_thread=None,
+        activity_pools: Optional[Dict[str, "PoseActivityPool"]] = None,
     ) -> None:
         super().__init__(name="pose_processor")
         self.config = config
@@ -62,8 +71,29 @@ class TrackedPoseProcessor(threading.Thread):
         self.camera_states: dict[str, CameraState] = {}
         self.frame_manager = SharedMemoryFrameManager()
 
-        # Activity detectors for each camera
+        # Activity detectors for each camera. Each entry is either a
+        # locally-instantiated `PoseActivityDetector` (today's default) or
+        # a `PoolActivityDetectorProxy` that forwards to a shared pool
+        # worker when the camera's config references
+        # `pose.activity_detector_pool`.
         self.activity_detectors: Dict[str, PoseActivityDetector] = {}
+
+        # Pool wrappers keyed by name, spawned upstream in frigate/app.py.
+        # Empty dict means "no pools configured" → all cameras use local
+        # detectors via the existing initialize_activity_detector() path.
+        self.activity_pools: Dict[str, "PoseActivityPool"] = activity_pools or {}
+
+        # Shared last-known-classification cache for pool-routed cameras.
+        # Keyed by (camera, pose_id) → (PoseActionTypeEnum, confidence).
+        # The pool result listener thread (below) mutates this; the pool
+        # proxies read from it when a camera's tracked_pose asks for the
+        # current classification.
+        self._pool_last_known: Dict[tuple, tuple] = {}
+
+        # Listener thread started lazily on first camera that needs a pool.
+        # None until initialize_activity_detector() binds a camera to a
+        # pool and kicks off the drain loop.
+        self._pool_listener_thread: Optional[threading.Thread] = None
 
         self.camera_config_subscriber = CameraConfigUpdateSubscriber(
             self.config,
@@ -77,6 +107,11 @@ class TrackedPoseProcessor(threading.Thread):
         )
 
         self.detection_publisher = DetectionPublisher(DetectionTypeEnum.all.value)
+        # Side-channel for shipping per-frame webp thumbnail bytes from
+        # integration.py through to pose_consumer without changing the
+        # tuple shape on the main "video" sub-topic (which other consumers
+        # expect to be a fixed 6-tuple).
+        self.pose_thumb_publisher = DetectionPublisher(DetectionTypeEnum.pose.value)
         self.event_sender = EventUpdatePublisher()
         self.event_end_subscriber = EventEndSubscriber()
 
@@ -134,6 +169,38 @@ class TrackedPoseProcessor(threading.Thread):
             )
             return
 
+        # Pool routing takes precedence over inline activity_detector config.
+        # When set, assign a proxy detector to this camera that forwards
+        # classification calls into the named shared pool worker and returns
+        # the track's last-known action without blocking.
+        pool_name = getattr(
+            camera_config.pose, "activity_detector_pool", None
+        )
+        if pool_name:
+            pool = self.activity_pools.get(pool_name)
+            if pool is None:
+                logger.error(
+                    f"Camera {camera} references activity_detector_pool "
+                    f"'{pool_name}' but no such pool is configured — "
+                    f"falling back to inline activity_detector."
+                )
+            else:
+                from frigate.pose_activity_detectors.pool import (
+                    PoolActivityDetectorProxy,
+                )
+
+                proxy = PoolActivityDetectorProxy(
+                    pool=pool,
+                    last_known_cache=self._pool_last_known,
+                )
+                self.activity_detectors[camera] = proxy
+                self._ensure_pool_listener_started()
+                logger.info(
+                    f"Camera {camera} bound to pose activity detector pool "
+                    f"'{pool_name}' (fire-and-forget async)"
+                )
+                return
+
         # Create detector from camera config
         if (
             not hasattr(camera_config.pose, "activity_detector")
@@ -167,6 +234,66 @@ class TrackedPoseProcessor(threading.Thread):
                     f"Both primary and fallback detectors failed for camera {camera}. "
                     f"Pose detection will continue but activity detection will be disabled."
                 )
+
+    def _ensure_pool_listener_started(self) -> None:
+        """Lazy-start the single background thread that drains every pool's
+        output queue and updates the shared `_pool_last_known` cache keyed
+        by (camera, pose_id).
+
+        One listener is sufficient regardless of how many pools are
+        configured — the listener round-robins non-blocking polls across
+        every registered pool per tick.
+        """
+        if self._pool_listener_thread is not None:
+            return
+
+        def _run() -> None:
+            logger.info(
+                f"Pose activity pool listener started "
+                f"({len(self.activity_pools)} pool(s))"
+            )
+            while not self.stop_event.is_set():
+                progressed = False
+                for pool in self.activity_pools.values():
+                    try:
+                        result = pool.get_result(timeout=0.0)
+                    except Exception:
+                        result = None
+                    if result is None:
+                        continue
+                    progressed = True
+                    try:
+                        camera, pose_id, action_value, confidence = result
+                        try:
+                            action_enum = PoseActionTypeEnum(action_value)
+                        except ValueError:
+                            logger.debug(
+                                f"pool result with unknown action {action_value!r}"
+                            )
+                            continue
+                        self._pool_last_known[(camera, pose_id)] = (
+                            action_enum,
+                            float(confidence),
+                        )
+                    except Exception:
+                        logger.exception("pool listener failed to apply result")
+                if not progressed:
+                    # No pool had a ready result — small sleep to avoid
+                    # busy-waiting. Tuned to give worst-case ~50 ms lag
+                    # from worker publish to cache update, well under
+                    # the 200 ms frame interval at 5 fps.
+                    try:
+                        self.stop_event.wait(timeout=0.05)
+                    except Exception:
+                        pass
+            logger.info("Pose activity pool listener exiting")
+
+        self._pool_listener_thread = threading.Thread(
+            name="pose-activity-pool-listener",
+            target=_run,
+            daemon=True,
+        )
+        self._pool_listener_thread.start()
 
     def _try_initialize_detector(self, camera: str, config_dict: dict) -> bool:
         """
@@ -491,9 +618,18 @@ class TrackedPoseProcessor(threading.Thread):
                 try:
                     queue_data = self.tracked_poses_queue.get(True, 1)
 
-                    # Check the format of the data we received
-                    if len(queue_data) == 6:
-                        # Data format: (camera, frame_name, frame_time, tracked_poses, motion_boxes, regions)
+                    # Check the format of the data we received.
+                    #
+                    # Three known shapes (oldest first):
+                    #   5-tuple: (camera, frame_time, tracked_poses, motion_boxes, regions)
+                    #   6-tuple A: (camera, frame_name, frame_time, tracked_poses, motion_boxes, regions)
+                    #   6-tuple B: (camera, frame_time, tracked_poses, motion_boxes, regions, thumbnail_bytes)
+                    #
+                    # Disambiguate 6-tuple A vs B by the type of the 2nd item:
+                    # A has a string `frame_name`, B has a float `frame_time`.
+                    thumbnail_bytes = None
+                    if len(queue_data) == 6 and isinstance(queue_data[1], str):
+                        # 6-tuple A: includes frame_name
                         (
                             camera,
                             frame_name,
@@ -502,8 +638,20 @@ class TrackedPoseProcessor(threading.Thread):
                             motion_boxes,
                             regions,
                         ) = queue_data
+                    elif len(queue_data) == 6:
+                        # 6-tuple B: includes thumbnail_bytes (the new format
+                        # produced by integration.py)
+                        (
+                            camera,
+                            frame_time,
+                            tracked_poses,
+                            motion_boxes,
+                            regions,
+                            thumbnail_bytes,
+                        ) = queue_data
+                        frame_name = f"{camera}_{frame_time}"
                     else:
-                        # Older format: (camera, frame_time, tracked_poses, motion_boxes, regions)
+                        # 5-tuple: legacy
                         camera, frame_time, tracked_poses, motion_boxes, regions = (
                             queue_data
                         )
@@ -557,9 +705,24 @@ class TrackedPoseProcessor(threading.Thread):
                             if activity_detector and activity_detector.initialized:
                                 pose.active_detector = activity_detector
 
-                            # Force update to ensure pose action analysis is triggered
-                            # This ensures _analyze_pose_action is called for every processed pose
-                            pose.update(pose.keypoints, pose.confidence, pose.bbox)
+                            # Only run the activity classifier on fresh
+                            # keypoints. `tracked_poses` is returned from
+                            # `PoseDetectionIntegration.detect_poses()` and
+                            # intentionally includes stale TrackedPose
+                            # instances (time_since_update > 0) kept alive
+                            # under `track_max_disappeared_seconds` so
+                            # downstream CameraState lifecycles don't
+                            # flicker on brief pose-detector drops.
+                            # Classifying frozen keypoints would feed any
+                            # sliding-window classifier a constant-valued
+                            # buffer and produce spurious events; this gate
+                            # is a data-quality filter and the single site
+                            # that triggers classification. `TrackedPose.update()`
+                            # (called from integration.py's match/create path)
+                            # only advances tracking state; classification
+                            # is lifted here to avoid firing twice per frame.
+                            if getattr(pose, "time_since_update", 0) == 0:
+                                pose.classify()
 
                     # Convert tracked poses list to a dictionary keyed by pose ID
                     # CameraState.update expects a dictionary with keys, not a list
@@ -685,7 +848,11 @@ class TrackedPoseProcessor(threading.Thread):
                         regions,
                     )
 
-                    # Publish detection info for this frame
+                    # Publish detection info for this frame on the standard
+                    # "video" sub-topic.  Tuple shape MUST stay at 6 elements
+                    # because the recording maintainer, review maintainer,
+                    # embeddings maintainer, and output process all subscribe
+                    # to this topic and unpack a fixed-length 6-tuple.
                     self.detection_publisher.publish(
                         (
                             camera,
@@ -698,8 +865,28 @@ class TrackedPoseProcessor(threading.Thread):
                             motion_boxes,
                             regions,
                         ),
-                        DetectionTypeEnum.video.value,  # Use "video" type since pose is not defined in enum
+                        DetectionTypeEnum.video.value,
                     )
+
+                    # Side-channel: publish the per-frame webp thumbnail bytes
+                    # on a separate "pose" sub-topic that only pose_consumer
+                    # subscribes to.  Bytes are base64-encoded so json.dumps
+                    # in the ZMQ Publisher can serialize them.  pose_consumer
+                    # decodes and persists them to disk when a pose-driven
+                    # Event finalizes.
+                    if thumbnail_bytes:
+                        try:
+                            thumbnail_b64 = base64.b64encode(thumbnail_bytes).decode(
+                                "ascii"
+                            )
+                            self.pose_thumb_publisher.publish(
+                                (camera, frame_time, thumbnail_b64),
+                                DetectionTypeEnum.pose.value,
+                            )
+                        except Exception:
+                            logger.debug(
+                                f"Failed to publish pose thumbnail for {camera}"
+                            )
 
                     # Update camera activity based on the poses
                     self._update_camera_activity(camera, tracked_poses)
@@ -734,6 +921,7 @@ class TrackedPoseProcessor(threading.Thread):
             state.shutdown()
 
         self.detection_publisher.stop()
+        self.pose_thumb_publisher.stop()
         self.event_sender.stop()
         self.event_end_subscriber.stop()
         self.camera_config_subscriber.stop()

@@ -196,7 +196,7 @@ class TrackedObjectProcessor(threading.Thread):
                 )
 
                 if jpg_bytes is None:
-                    logger.warning(
+                    logger.debug(
                         f"Unable to send mqtt snapshot for {obj.obj_data['id']}."
                     )
                 else:

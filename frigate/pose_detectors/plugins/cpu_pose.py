@@ -3,7 +3,10 @@ import logging
 import numpy as np
 
 from frigate.pose_detectors.detection_api import PoseDetectionApi
-from frigate.pose_detectors.detector_config import BasePoseDetectorConfig, PoseModelTypeEnum
+from frigate.pose_detectors.detector_config import (
+    BasePoseDetectorConfig,
+    PoseModelTypeEnum,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +41,9 @@ class CpuPoseApi(PoseDetectionApi):
         # 1. Load the model (ONNX, TensorFlow, etc.)
         # 2. Run inference on tensor_input
         # 3. Post-process results to standard format
-        
+
         logger.debug("Running CPU pose detection (placeholder)")
-        
+
         # Return empty pose array in expected format
         # Shape: (max_poses, 57) where 57 = person_id(1) + confidence(1) + keypoints(17*3) + bbox(4)
         return np.zeros((20, 57), dtype=np.float32)

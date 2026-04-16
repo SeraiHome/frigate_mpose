@@ -22,9 +22,12 @@ from typing_extensions import Self
 from frigate.const import REGEX_JSON
 from frigate.detectors import DetectorConfig, ModelConfig
 from frigate.detectors.detector_config import BaseDetectorConfig
-from frigate.pose_detectors import PoseDetectorConfig, PoseModelConfig
-from frigate.pose_detectors.detector_config import BasePoseDetectorConfig
 from frigate.plus import PlusApi
+from frigate.pose_activity_detectors.detector_config import (
+    BasePoseActivityDetectorConfig,
+)
+from frigate.pose_detectors import PoseModelConfig
+from frigate.pose_detectors.detector_config import BasePoseDetectorConfig
 from frigate.util.builtin import (
     deep_merge,
     get_ffmpeg_arg_list,
@@ -366,6 +369,24 @@ class FrigateConfig(FrigateBaseModel):
     )
     pose_model: PoseModelConfig = Field(
         default_factory=PoseModelConfig, title="Pose detection model configuration."
+    )
+
+    # Pose activity detector pools — shared worker processes that serve
+    # classification requests from multiple cameras against a single
+    # interpreter / accelerator device. Each entry spawns one
+    # PoseActivityDetectProcess at startup; cameras opt into a pool via
+    # `pose.activity_detector_pool: <name>` in their per-camera config.
+    # Leaving this empty preserves today's per-camera local-detector path.
+    pose_activity_detectors: Dict[str, BasePoseActivityDetectorConfig] = Field(
+        default_factory=dict,
+        title="Pose activity detector pool configurations.",
+        description=(
+            "Named shared pools for pose activity classification. Each pool "
+            "hosts one classifier (e.g. fall detection) in a dedicated "
+            "worker process and serves multiple cameras via an mp.Queue "
+            "request interface. Cameras opt in via "
+            "`cameras.<name>.pose.activity_detector_pool`."
+        ),
     )
 
     # GenAI config

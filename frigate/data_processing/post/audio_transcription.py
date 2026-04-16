@@ -145,9 +145,9 @@ class AudioTranscriptionPostProcessor(PostProcessorApi):
             logger.debug("Recognizer not initialized")
             return None
 
+        temp_wav = os.path.join(CACHE_DIR, f"temp_audio_{int(time.time())}.wav")
         try:
             # Save audio data to a temporary wav (faster-whisper expects a file)
-            temp_wav = os.path.join(CACHE_DIR, f"temp_audio_{int(time.time())}.wav")
             with open(temp_wav, "wb") as f:
                 f.write(audio_data)
 
@@ -156,8 +156,6 @@ class AudioTranscriptionPostProcessor(PostProcessorApi):
                 language=self.config.audio_transcription.language,
                 beam_size=5,
             )
-
-            os.remove(temp_wav)
 
             # Combine all segment texts
             text = " ".join(segment.text.strip() for segment in segments)
@@ -173,6 +171,9 @@ class AudioTranscriptionPostProcessor(PostProcessorApi):
         except Exception as e:
             logger.error(f"Error transcribing audio: {e}")
             return None
+        finally:
+            if os.path.exists(temp_wav):
+                os.remove(temp_wav)
 
     def _transcription_wrapper(self, event: dict[str, any]) -> None:
         """Wrapper to run transcription and reset running flag when done."""

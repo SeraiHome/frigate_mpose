@@ -20,6 +20,7 @@ class CameraConfigUpdateEnum(str, Enum):
     motion = "motion"  # includes motion and motion masks
     notifications = "notifications"
     objects = "objects"
+    pose = "pose"
     object_genai = "object_genai"
     record = "record"
     remove = "remove"  # for removing a camera
@@ -117,6 +118,8 @@ class CameraConfigUpdateSubscriber:
             config.semantic_search = updated_config
         elif update_type == CameraConfigUpdateEnum.snapshots:
             config.snapshots = updated_config
+        elif update_type == CameraConfigUpdateEnum.pose:
+            config.pose = updated_config
         elif update_type == CameraConfigUpdateEnum.zones:
             config.zones = updated_config
 

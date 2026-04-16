@@ -1,49 +1,26 @@
 mqtt:
   host: mqtt
 
-go2rtc:
-  streams:
-    # Real camera (used by detect + proxy pre-event, NOT exposed as "iphone"
-    # so the web UI falls back to JSMPEG which reads from SHM with skeleton substitution)
-    iphone_real:
-      - rtsp://192.168.1.71:8554/live.sdp
-
 logger:
   default: info
   logs:
-    frigate.track.tracked_pose: info
-    frigate.video: info
-    frigate.pose_detection.integration: info
-    frigate.pose_detection.base: info
-    frigate.events: info
-    frigate.detectors.plugins: info
     frigate.pose_detection: info
-    frigate.pose_detectors: info
-    frigate.pose_detectors.plugins.mediapipe_pose: info
-    frigate.pose_activity_detectors.plugins.stgcn_fall: info
-    frigate.track.pose_consumer: debug
+    frigate.pose_activity_detectors: info
+    frigate.track.pose_processing: info
 
-# Pose detector configurations
+# Pose detector configurations — frame → keypoints
 pose_detectors:
-  # mediapipe:
-  #   type: mediapipe
-  #   model_complexity: 2 # 0: Lite, 1: Full, 2: Heavy
-  #   min_detection_confidence: 0.5
-  #   min_tracking_confidence: 0.5
-  #   smooth_landmarks: true
   mediapipe_task:
     type: mediapipe_task
     model_complexity: 2 # 0: Lite, 1: Full, 2: Heavy
-    num_poses: 1 # Maximum number of poses to detect
-    min_detection_confidence: 0.3
+    num_poses: 1
+    min_detection_confidence: 0.5
     min_pose_presence_confidence: 0.5
     min_tracking_confidence: 0.5
-    running_mode: video # Options: "image", "video", or "live_stream"
-    # model_path: /path/to/custom/model.task # Optional custom model path
+    running_mode: video
+    num_threads: 3
 
-    num_threads: 3 # Optional number of interpreter threads for CPU/TFLite
-
-# Pose model configuration (for YOLO-based detectors)
+# Pose model metadata (frame dimensions fed to the detector)
 pose_model:
   width: 320
   height: 320
@@ -51,491 +28,65 @@ pose_model:
   input_tensor: nhwc
   input_pixel_format: rgb
 
+# Optional shared activity classifier pools — for HW accelerator deployments.
+#
+# Each entry spawns one dedicated worker process that serves classification
+# requests from any camera referencing this pool by name. This is the right
+# pattern when multiple cameras need to share a single hardware accelerator
+# device (e.g. one Coral USB TPU). For CPU-only deployments, per-camera
+# inline classifiers (the default) are simpler, lower-latency, and allow
+# concurrent inference across cameras. See docs/PLUGIN_ARCHITECTURE.md §5b.
+#
+# pose_activity_detectors:
+#   activity_pool:
+#     type: heuristic
+#     confidence_threshold: 0.5
+
 cameras:
-  test_camera:
+  example_camera:
     enabled: false
     ffmpeg:
       inputs:
-        - path: /config/Lei2/Coffee_room_02/Videos/video_56_mjpeg.avi
+        - path: rtsp://user:password@camera.example.com/stream
           roles:
-            - record
             - detect
+            - record
     detect:
-      enabled: false
-    #   width: 720
-    #   height: 480
-    #   fps: 30
-    #   min_initialized: 1
-    # stationary:
-    # interval: 100
-    # threshold: 10
-    # record:
-    #   enabled: true
-    # live:
-    # stream_name: test_stream
+      enabled: true
+      fps: 5
     snapshots:
       enabled: true
-      clean_copy: true
-      timestamp: false
-      bounding_box: true
-      crop: false
-      height: 175
-
     record:
       enabled: true
-      alerts:
-        retain:
-          days: 1
-          mode: motion
-      detections:
-        retain:
-          days: 1
-          mode: motion
-    zones:
-      floor:
-        coordinates: 0.266,0.599,0.274,1,0.843,0.994,0.965,0.992,0.646,0.583
-        loitering_time: 0
-        inertia: 3
-        objects: person
-    review:
-      detections: {}
-
-    # Pose detection configuration
-
-    pose:
-      enabled: true
-      publish_to_detected_objects: true
-      privacy_mode: true
-      privacy_background: scene  # "black" (solid) or "scene" (room background from motion detector)
-      publish_keypoints: true
-      # detector: mediapipe_task # Use the new MediaPipe Task API detector
-      confidence_threshold: 0.01
-      skip_frames: 0
-      # keypoint_threshold: 0.3
-      use_motion_roi: true
-      # fps: 15 # Pose detection FPS (should be <= camera detect fps)
-
-      # Activity detector configuration
-      activity_detector:
-        type: stgcn_fall
-        # Use a model path that will be checked in order of existence
-        model_path: 
-          /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/window_60_random_fps_2_le2i_montreal_clips_f1_edgetpu.tflite
-        confidence_threshold: 0.5
-        num_threads: 3
-        effective_window_size: 40
-        # accelerator: edgetpu # e.g. "edgetpu" to use Coral USB accelerator
-        # device: usb # Optional device identifier passed to delegate loader
-
-      # Actions to track
-
-      actions:
-        # - standing
-        # - walking
-        # - sitting
-        # - lying
-        - falling # New action type for fall detection
-        # - waving
-        # - pointing
-
-      # Actions that trigger snapshots
-      snapshot_actions:
-        # - waving
-        # - pointing
-        - falling # Capture snapshots when falls are detected
-
-      # Actions that trigger recording retention
-      record_actions:
-        # - walking
-        # - running
-        # - jumping
-        - falling # Ensure recordings are retained when falls are detected
-
-      # Action-specific filters
-      # filters:
-      # waving:
-      #   min_score: 0.6
-      #   threshold: 0.5
     motion:
-      threshold: 48
-      contour_area: 78
       improve_contrast: true
-
-  test_camera2:
-    enabled: false
-    ffmpeg:
-      inputs:
-        - path: /config/Lei2/Coffee_room_02/Videos/video_55_mjpeg.avi
-          roles:
-            - record
-            - detect
-    detect:
-      enabled: false
-    #   width: 720
-    #   height: 480
-    #   fps: 30
-    #   min_initialized: 1
-    # stationary:
-    # interval: 100
-    # threshold: 10
-    # record:
-    #   enabled: true
-    # live:
-    # stream_name: test_stream
-    snapshots:
-      enabled: true
-      clean_copy: true
-      timestamp: false
-      bounding_box: true
-      crop: false
-      height: 175
-
-    record:
-      enabled: true
-      alerts:
-        retain:
-          days: 1
-          mode: motion
-      detections:
-        retain:
-          days: 1
-          mode: motion
-
-    zones:
-      floor:
-        coordinates: 0.263,0.584,0.257,0.989,0.855,1,0.973,1,0.688,0.575
-        loitering_time: 0
-        inertia: 1
-        objects: person
     review:
       detections: {}
-    # Pose detection configuration
 
+    # Pose detection runs in a dedicated per-camera worker.
     pose:
       enabled: true
-      publish_to_detected_objects: true
-      privacy_mode: true
-      privacy_background: scene  # "black" (solid) or "scene" (room background from motion detector)
-      publish_keypoints: true
-      # detector: mediapipe # Use the MediaPipe pose detector defined in pose_detectors section
-      confidence_threshold: 0.1
-      # keypoint_threshold: 0.3
-      skip_frames: 0
-      use_motion_roi: true # Crop to motion region
-      # Activity detector configuration
+
+      # Per-camera inline classifier (default, recommended for CPU).
+      # Each camera gets its own classifier instance in its own thread.
+      # TFLite releases the GIL so N cameras = N concurrent inferences.
       activity_detector:
-        type: stgcn_fall
-        model_path: 
-          /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/stgcn_window_60_le2i_montreal.tflite
+        type: heuristic
         confidence_threshold: 0.5
-        num_threads: 3
-        effective_window_size: 40
-        # accelerator: edgetpu # e.g. "edgetpu" to use Coral USB accelerator
-        # device: usb # Optional device identifier passed to delegate loader
 
-      # Actions to track
+      # For shared-accelerator deployments (e.g. Coral USB TPU), route
+      # classifier calls into a pool instead:
+      # activity_detector_pool: activity_pool
 
       actions:
-        # - standing
-        # - walking
-        # - sitting
-        # - lying
-        - falling # New action type for fall detection
-        # - waving
-        # - pointing
-
-      # Actions that trigger snapshots
-      snapshot_actions:
-        # - waving
-        # - pointing
-        - falling # Capture snapshots when falls are detected
-
-      # Actions that trigger recording retention
-      record_actions:
-        # - walking
-        # - running
-        # - jumping
-        - falling # Ensure recordings are retained when falls are detected
-
-      # Action-specific filters
-      # filters:
-      # waving:
-      #   min_score: 0.6
-      #   threshold: 0.5
-
-    motion:
-      threshold: 48
-      contour_area: 78
-      improve_contrast: true
-  test_camera1:
-    enabled: false
-    ffmpeg:
-      inputs:
-        - path: /config/Lei2/Coffee_room_02/Videos/video_55_mjpeg.avi
-          input_args: -re -stream_loop -1
-          roles:
-            - detect
-            - rtmp
-            - record
-    detect:
-      enabled: true
-      # width: 720
-      # height: 480
-      # fps: 30
-      # min_initialized: 1
-    # stationary:
-    # interval: 100
-    # threshold: 10
-    # record:
-    #   enabled: true
-    # live:
-    # stream_name: test_stream
-    snapshots:
-      enabled: true
-      clean_copy: true
-      timestamp: false
-      bounding_box: true
-      crop: false
-      height: 175
-
-    record:
-      enabled: true
-    zones:
-      floor:
-        coordinates: 0.861,0.498,0.84,0.822,0.838,0.985,0.948,0.971,0.98,0.602
-        loitering_time: 0
-        inertia: 3
-    review:
-      detections: {}
-      # Pose detection configuration
-
-    pose:
-      enabled: true
-      publish_to_detected_objects: false
-      # detector: mediapipe # Use the MediaPipe pose detector defined in pose_detectors section
-      confidence_threshold: 0.01
-      # keypoint_threshold: 0.3
-      # fps: 30 # Pose detection FPS (should be <= camera detect fps)
-
-      # Activity detector configuration
-      activity_detector:
-        type: stgcn_fall
-        model_path: 
-          /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/window_60_random_fps_2_le2i_montreal_clips_f1_edgetpu.tflite
-        confidence_threshold: 0.1
-        num_threads: 3
-        effective_window_size: 40
-
-      # Actions to track
-
-      actions:
-        # - standing
-        # - walking
-        # - sitting
-        # - lying
-        - falling # New action type for fall detection
-        # - waving
-        # - pointing
-
-      # Actions that trigger snapshots
-      snapshot_actions:
-        # - waving
-        # - pointing
-        - falling # Capture snapshots when falls are detected
-
-      # Actions that trigger recording retention
-      record_actions:
-        # - walking
-        # - running
-        # - jumping
-        - falling # Ensure recordings are retained when falls are detected
-
-      # Action-specific filters
-      # filters:
-      # waving:
-      #   min_score: 0.6
-      #   threshold: 0.5
-
-  test_camera3:
-    enabled: false
-    ffmpeg:
-      inputs:
-        - path: /config/Lei2/Coffee_room_02/Videos/video_55_mjpeg.avi
-          input_args: -re -stream_loop -1
-          roles:
-            # - detect
-            - rtmp
-            # - record
-    # detect:
-    #   enabled: true
-    #   width: 720
-    #   height: 480
-    #   fps: 30
-    #   min_initialized: 1
-    # stationary:
-    # interval: 100
-    # threshold: 10
-    # record:
-    #   enabled: true
-    # live:
-    # stream_name: test_stream
-
-    zones:
-      floor:
-        coordinates: 0.861,0.498,0.84,0.822,0.838,0.985,0.948,0.971,0.98,0.602
-        loitering_time: 0
-        inertia: 3
-    review:
-      detections: {}
-      # Pose detection configuration
-
-    pose:
-      enabled: false
-      # detector: mediapipe # Use the MediaPipe pose detector defined in pose_detectors section
-      # confidence_threshold: 0.5
-      # keypoint_threshold: 0.3
-      # fps: 30 # Pose detection FPS (should be <= camera detect fps)
-
-      # Activity detector configuration
-      activity_detector:
-        type: stgcn_fall
-        model_path: 
-          /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/stgcn_window_60_le2i_montreal.tflite
-        confidence_threshold: 0.7
-        num_threads: 3
-
-      # Actions to track
-
-      actions:
-        # - standing
-        # - walking
-        # - sitting
-        # - lying
-        - falling # New action type for fall detection
-        # - waving
-        # - pointing
-
-      # Actions that trigger snapshots
-      snapshot_actions:
-        # - waving
-        # - pointing
-        - falling # Capture snapshots when falls are detected
-
-      # Actions that trigger recording retention
-      record_actions:
-        # - walking
-        # - running
-        # - jumping
-        - falling # Ensure recordings are retained when falls are detected
-
-      # Action-specific filters
-      # filters:
-      # waving:
-      #   min_score: 0.6
-      #   threshold: 0.5
-
-  iphone:
-    enabled: true
-    ffmpeg:
-      inputs:
-        # Real source for detection via go2rtc relay (single camera connection)
-        - path: rtsp://127.0.0.1:8554/iphone_real
-          input_args: -rtsp_transport tcp
-          roles:
-            - detect
-        # Privacy proxy output: read raw frames directly from proxy TCP
-        - path: tcp://privacy-proxy:9000
-          input_args: -f rawvideo -pix_fmt bgr24 -video_size 1280x720 -framerate 30
-          roles:
-            - record
-      output_args:
-        record: -f segment -segment_time 10 -segment_format mp4 -reset_timestamps 1 -strftime 1 -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -an
-    detect:
-      enabled: false
-    snapshots:
-      enabled: true
-      clean_copy: true
-      timestamp: false
-      bounding_box: true
-      crop: false
-      height: 175
-    record:
-      enabled: true
-      alerts:
-        retain:
-          days: 1
-          mode: all
-      detections:
-        retain:
-          days: 1
-          mode: all
-    pose:
-      enabled: true
-      publish_to_detected_objects: true
-      privacy_mode: true
-      privacy_background: scene
-      publish_keypoints: true
-      confidence_threshold: 0.1
-      skip_frames: 0
-      use_motion_roi: false
-      activity_detector:
-        type: stgcn_fall
-        model_path:
-          /workspace/frigate/frigate/pose_detection/fall_processor/models_weights/stgcn_window_60_le2i_montreal.tflite
-        confidence_threshold: 0.5
-        num_threads: 3
-        effective_window_size: 40
-      actions:
+        - standing
+        - walking
+        - sitting
+        - lying
         - falling
       snapshot_actions:
         - falling
       record_actions:
         - falling
-    motion:
-      threshold: 48
-      contour_area: 78
-      improve_contrast: true
 
-  rpicamera:
-    # Run camera_to_v4l2.sh on the raspberry pi for the camera to work.
-    # The script creates a v4l2loopback that ffmpeg seems to be needing
-    enabled: false
-    ffmpeg:
-      inputs:
-        - path: /dev/video10
-            # make sure to copy the same args in camera_to_v4l2.sh
-          input_args:
-            - -f
-            - v4l2
-            - -input_format
-            - yuv420p
-            - -video_size
-            - 640x480
-            - -framerate
-            - '30'
-          roles:
-            # - detect
-            - rtmp
-            # - record
-      output_args:
-        record: -f segment -segment_time 60 -reset_timestamps 1 -strftime 1 -c:v
-          libx264 -pix_fmt yuv420p -an
-
-    # detect:
-    #   enabled:
-    #     true
-    #     # width: 320
-    #     # height: 320
-    #   fps: 5
-    #   min_initialized: 1
-    #   stationary:
-    #     interval: 10
-    #     threshold: 50
-    #     max_frames:
-    #       default: 1
-    #       objects:
-    #         person: 1
-
-    # record:
-    #   enabled: true
 version: 0.17-0

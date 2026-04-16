@@ -95,7 +95,14 @@ class TrackedPose:
     def update(
         self, keypoints: np.ndarray, confidence: float, bbox: Optional[list] = None
     ):
-        """Update pose with new detection."""
+        """Tracking-state update. Records fresh keypoints/confidence/bbox and
+        advances tracker bookkeeping. Does NOT run activity classification —
+        call `classify()` separately when the caller has decided this frame
+        carries new information that justifies inference. Split from
+        classification so integration.py's match/create path and
+        pose_processing.py's consumer loop can't both fire the classifier
+        for the same frame.
+        """
         self.keypoints = keypoints
         self.confidence = confidence
         if bbox:
@@ -104,12 +111,13 @@ class TrackedPose:
         self.hit_streak += 1
         self.time_since_update = 0
 
-        # Add to history
-        self.keypoint_history.append(
-            keypoints.copy()
-        )  # Will automatically maintain max length
+        self.keypoint_history.append(keypoints.copy())
 
-        # Analyze pose action
+    def classify(self):
+        """Run the activity detector on the current keypoints. Callers must
+        gate on `time_since_update == 0` to avoid feeding the classifier
+        stale buffered keypoints during brief pose-detector drops.
+        """
         self._analyze_pose_action()
 
     def predict(self):
@@ -166,11 +174,16 @@ class TrackedPose:
                         )
                         self.keypoints = np.nan_to_num(self.keypoints)
 
-                    # Pass frame dimensions if available
+                    # Pass frame dimensions and the stable (camera, pose_id)
+                    # pair so the detector can maintain per-track state for
+                    # a shared pool worker serving multiple cameras. Legacy
+                    # single-camera detectors ignore the camera kwarg.
                     action, confidence = self.active_detector.detect(
                         self.keypoints,
                         frame_width=self.frame_width,
                         frame_height=self.frame_height,
+                        pose_id=self.pose_id,
+                        camera=self.camera_name,
                     )
                     logger.debug(
                         f"Detector result: action={action}, confidence={confidence:.2f}"

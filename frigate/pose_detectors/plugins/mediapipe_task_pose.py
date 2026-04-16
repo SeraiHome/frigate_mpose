@@ -1,6 +1,5 @@
 import logging
 import os
-import tempfile
 import urllib.request
 from time import time
 
@@ -8,6 +7,7 @@ import cv2
 import numpy as np
 
 import frigate.const as const
+from frigate.const import MODEL_CACHE_DIR
 from frigate.pose_detection.tensor_utils import (
     create_pose_output,
     create_pose_output_batch,
@@ -30,16 +30,14 @@ MP_TASK_MODEL_VARIANTS = {
 }
 MP_MODEL_URL_BASE = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
 
-# Create a writable directory for MediaPipe models
+# Use persistent model cache directory (consistent with other models in the codebase)
+MEDIAPIPE_MODEL_DIR = os.path.join(MODEL_CACHE_DIR, "mediapipe")
 try:
-    MEDIAPIPE_MODEL_DIR = os.path.join(
-        tempfile.gettempdir(), "frigate_mediapipe_models"
-    )
     os.makedirs(MEDIAPIPE_MODEL_DIR, exist_ok=True)
     logger.info(f"Set MediaPipe model directory to {MEDIAPIPE_MODEL_DIR}")
 except Exception as e:
     logger.warning(f"Failed to create MediaPipe model directory: {e}")
-    MEDIAPIPE_MODEL_DIR = tempfile.gettempdir()
+    MEDIAPIPE_MODEL_DIR = MODEL_CACHE_DIR
 
 
 # Function to pre-download a model to our custom directory
@@ -123,15 +121,20 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
                 self.mp_drawing = mp.solutions.drawing_utils
             except AttributeError:
                 self.mp_drawing = None
-                logger.info("mp.solutions.drawing_utils not available, debug visualization disabled")
+                logger.info(
+                    "mp.solutions.drawing_utils not available, debug visualization disabled"
+                )
 
             # Import necessary classes for landmark conversion (optional, debug only)
             try:
                 from mediapipe.framework.formats import landmark_pb2
+
                 self.landmark_pb2 = landmark_pb2
             except ImportError:
                 self.landmark_pb2 = None
-                logger.info("mediapipe.framework not available, landmark proto conversion disabled")
+                logger.info(
+                    "mediapipe.framework not available, landmark proto conversion disabled"
+                )
 
             # Attempt to preload an EdgeTPU delegate if configured for this detector.
             # accel = getattr(detector_config, "accelerator", None)
@@ -216,7 +219,6 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
                     # Center the square region
                     x_center = frame_width // 2
                     y_center = y_height // 2
-                    half_size = square_size // 2
 
                     # Create square region centered in the frame
                     region = (
@@ -308,7 +310,9 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
 
             # Save visualization if landmarks are detected and debug dir exists
             debug_dir = os.path.join(const.BASE_DIR, "debug")
-            if self.landmark_pb2 and self.mp_drawing:  # results.pose_landmarks and os.path.exists(debug_dir):
+            if (
+                self.landmark_pb2 and self.mp_drawing
+            ):  # results.pose_landmarks and os.path.exists(debug_dir):
                 try:
                     # Create a copy of the RGB image for visualization
                     vis_image = image_rgb.copy()
@@ -353,10 +357,9 @@ class MediaPipeTaskPoseApi(PoseDetectionApi):
                             (29, 31),
                             (30, 32),
                         ]
-                        if self.mp_drawing:
-                            self.mp_drawing.draw_landmarks(
-                                vis_image, landmark_list, connections
-                            )
+                        self.mp_drawing.draw_landmarks(
+                            vis_image, landmark_list, connections
+                        )
 
                     # Convert RGB to BGR for OpenCV's imwrite
                     vis_image_bgr = cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR)

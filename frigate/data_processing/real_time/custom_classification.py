@@ -342,7 +342,7 @@ def write_classification_attempt(
     cv2.imwrite(file, frame)
 
     files = sorted(
-        filter(lambda f: (f.endswith(".webp")), os.listdir(folder)),
+        filter(lambda f: f.endswith(".webp"), os.listdir(folder)),
         key=lambda f: os.path.getctime(os.path.join(folder, f)),
         reverse=True,
     )

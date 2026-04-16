@@ -2,6 +2,11 @@
 
 set -euxo pipefail
 
+# MediaPipe Tasks requires OpenGL ES 2.0 (libGLESv2.so.2) for its native
+# C bindings.  The production Docker image ships this via mesa, but the
+# devcontainer base image may not include it.
+sudo apt-get update -qq && sudo apt-get install -y -qq libegl1 libgles2 libgl1-mesa-glx >/dev/null 2>&1 || true
+
 # Ensure git treats the mounted workspace as safe (ownership differs on Windows hosts)
 git config --global --add safe.directory /workspace/frigate 2>/dev/null || true
 
@@ -27,15 +32,8 @@ fi
 # Frigate normal container runs as root, so it have permission to create
 # the folders. But the devcontainer runs as the host user, so we need to
 # create the folders and give the host user permission to write to them.
-if command -v sudo &>/dev/null; then
-  sudo mkdir -p /media/frigate
-  sudo chown -R "$(id -u):$(id -g)" /media/frigate
-else
-  mkdir -p /media/frigate 2>/dev/null || true
-fi
-
-# Fix ownership of Claude data volume (Docker creates named volumes as root)
-sudo chown -R "$(id -u):$(id -g)" "$HOME/.claude" 2>/dev/null || true
+sudo mkdir -p /media/frigate
+sudo chown -R "$(id -u):$(id -g)" /media/frigate
 
 # When started as a service, LIBAVFORMAT_VERSION_MAJOR is defined in the
 # s6 service file. For dev, where frigate is started from an interactive
@@ -53,7 +51,22 @@ export PATH="$HOME/.npm-global/bin:$PATH"
 # Install Claude Code CLI (the VSCode extension delegates to this)
 npm install -g @anthropic-ai/claude-code
 
-make version
+# Setup user-level npm global directory (avoids EACCES on global installs)
+mkdir -p ~/.npm-global
+npm config set prefix '~/.npm-global'
+if ! grep -q 'npm-global' "$HOME/.bashrc" 2>/dev/null; then
+  echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> "$HOME/.bashrc"
+fi
+export PATH="$HOME/.npm-global/bin:$PATH"
+
+# Install Claude Code CLI (the VSCode extension delegates to this)
+npm install -g @anthropic-ai/claude-code
+
+if [[ -f Makefile ]] && git rev-parse --git-dir &>/dev/null; then
+  make version
+else
+  echo "Skipping 'make version' — Makefile or git history not available" >&2
+fi
 
 cd web
 

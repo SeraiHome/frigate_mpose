@@ -45,6 +45,19 @@ class PoseConfig(FrigateBaseModel):
         title="Activity detector configuration",
         description="Configuration for the pose activity detector.",
     )
+    activity_detector_pool: Optional[str] = Field(
+        default=None,
+        title="Activity detector pool name",
+        description=(
+            "Name of a shared pose activity detector pool defined at the "
+            "top-level `pose_activity_detectors:` config section. When set, "
+            "this camera routes its classifier calls into the shared pool "
+            "worker process instead of instantiating its own local detector "
+            "— enabling one interpreter (and one accelerator device) to "
+            "serve multiple cameras. Falls back to the inline "
+            "`activity_detector` config if left unset."
+        ),
+    )
     actions: Set[PoseActionTypeEnum] = Field(
         default_factory=lambda: {
             PoseActionTypeEnum.standing,
@@ -96,54 +109,83 @@ class PoseConfig(FrigateBaseModel):
             "poses are being missed near frame edges."
         ),
     )
-    publish_to_detected_objects: bool = Field(
+    detect_persons: bool = Field(
         default=True,
-        title="Publish pose detections to the main detected_objects queue.",
+        title="Use pose detector as a person presence detector.",
         description=(
-            "When true, pose detections will be added to the standard "
-            "detected_objects_queue in addition to being sent to the pose queues. "
-            "Set to false to avoid timing interference and use the pose-specific "
-            "processing pipeline instead."
+            "When true, all detected poses are injected into the object tracker "
+            "as 'person' detections, providing presence awareness even without "
+            "object detection enabled.  Only poses whose action matches the "
+            "configured 'actions' list will create review alerts; other poses "
+            "are tracked silently (visible in timeline/debug but no alerts)."
         ),
     )
-    privacy_mode: bool = Field(
-        default=False,
-        title="Privacy mode: show skeleton instead of real camera in web UI and snapshots.",
-        description=(
-            "When enabled, frames in shared memory are replaced with skeleton "
-            "renderings after pose detection runs. This affects the web UI "
-            "(JSMPEG), birdseye, and snapshots. The detection pipeline always "
-            "sees real frames for ML accuracy."
-        ),
-    )
-    privacy_override_seconds: int = Field(
+    event_cooldown_seconds: int = Field(
         default=60,
-        title="Duration in seconds to show real frames after a privacy override trigger.",
+        title="Cooldown before re-triggering the same (track, action) pose event.",
         description=(
-            "When an action in record_actions is detected and privacy_mode is "
-            "enabled, real camera frames are shown for this many seconds. "
-            "Applies to all three privacy layers: SHM (web UI/birdseye), "
-            "proxy TCP stream (recordings), and go2rtc live view (WebRTC/MSE)."
+            "After a pose-driven Event ends, suppress creation of a new Event "
+            "for the same tracked object + same action within this window. "
+            "Matches within the cooldown extend the existing Event's "
+            "end_time instead of fragmenting it. Different actions on the same "
+            "track (e.g. standing after falling) are NOT affected."
         ),
     )
-    privacy_background: str = Field(
-        default="black",
-        title="Background style for privacy mode skeleton rendering.",
+    track_max_disappeared_seconds: float = Field(
+        default=3.0,
+        title="Wall-clock seconds to retain a pose track without a detection update.",
         description=(
-            "Controls the background behind the skeleton overlay. "
-            "'black' renders skeletons on a solid black canvas. "
-            "'scene' uses the motion detector's running average of the "
-            "static room background (grayscale), giving a natural empty-room "
-            "appearance with colored skeletons on top."
+            "After this many seconds without a matching detection, the tracked "
+            "pose is deleted and the next detection for that subject receives "
+            "a new pose_track_id. Larger values hold track ids across pose "
+            "detector gaps (occlusion, awkward angles during a fall) so "
+            "event_cooldown_seconds can dedup them. Smaller values release "
+            "ids faster when subjects leave the frame. Default 3.0s is tuned "
+            "for fall-detection workloads at 2-10 fps. Prior behavior was a "
+            "hardcoded 10-frame threshold, which became 2s at 5fps and "
+            "0.33s at 30fps -- too aggressive for fall scenarios."
+        ),
+    )
+    track_match_iou_threshold: float = Field(
+        default=0.15,
+        title="Minimum bbox IoU for a detection to reuse an existing pose track id.",
+        description=(
+            "When both the incoming detection and an existing tracked pose "
+            "have bbox data, matching uses Intersection-over-Union of the "
+            "boxes. IoU >= this threshold is accepted as the same subject. "
+            "Higher values are stricter (fewer matches, more new ids); "
+            "lower values are more permissive. Default 0.15 is tuned for "
+            "low-fps (2-10 fps) fall scenarios where the pose detector "
+            "outputs significantly different bbox shapes between "
+            "consecutive frames (e.g. a 52x156 standing box becoming "
+            "71x334 one frame later as the pose detector re-estimates "
+            "the subject's extent). Even below this threshold, the "
+            "centroid fallback at track_match_centroid_threshold acts "
+            "as a second-chance rescue. IoU is rotation-invariant and "
+            "naturally discriminates multiple subjects whose boxes "
+            "don't overlap."
+        ),
+    )
+    track_match_centroid_threshold: float = Field(
+        default=0.15,
+        title="Fallback centroid-distance threshold (normalized by frame diagonal) when IoU is unavailable.",
+        description=(
+            "When IoU matching cannot run because either the detection or "
+            "the tracked pose lacks bbox data, the tracker falls back to "
+            "centroid distance normalized by the frame diagonal. A match "
+            "is accepted when dist/diagonal <= this value. Default 0.15 "
+            "(15% of diagonal); the prior hardcoded value of 0.10 was "
+            "too tight for fall transitions where the keypoint-mean "
+            "centroid jumps as the subject pivots horizontally."
         ),
     )
     publish_keypoints: bool = Field(
         default=False,
-        title="Publish pose keypoints to MQTT for the privacy proxy sidecar.",
+        title="Publish pose keypoints to MQTT.",
         description=(
             "When enabled, publishes COCO 17-keypoint coordinates to "
             "frigate/{camera}/pose_keypoints via MQTT after each detection. "
-            "Used by the external privacy proxy to generate skeleton RTSP "
-            "streams for recording privacy."
+            "Consumers can render skeletons, feed a second-stage classifier, "
+            "or drive downstream automations from the keypoint stream."
         ),
     )

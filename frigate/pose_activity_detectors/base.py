@@ -7,7 +7,7 @@ All specific detector implementations should inherit from this base class.
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -40,14 +40,43 @@ class PoseActivityDetector(ABC):
         pass
 
     @abstractmethod
-    def detect(self, keypoints: np.ndarray) -> Tuple[PoseActionTypeEnum, float]:
+    def detect(
+        self,
+        keypoints: np.ndarray,
+        frame_width: Optional[int] = None,
+        frame_height: Optional[int] = None,
+        pose_id: Optional[str] = None,
+        camera: Optional[str] = None,
+    ) -> Tuple[PoseActionTypeEnum, float]:
         """
         Detect the pose activity from keypoints.
 
         Args:
-            keypoints: NumPy array of shape (num_points, 3) where each row is [x, y, confidence]
+            keypoints: NumPy array of shape (num_points, 3) where each row is
+                [x, y, confidence]
+            frame_width: Width of the frame in pixels (optional).
+            frame_height: Height of the frame in pixels (optional).
+            pose_id: Stable id of the track feeding keypoints. Detectors that
+                maintain per-track state (sliding windows, smoothing buffers)
+                must key on this so keypoints from distinct subjects do not
+                interleave. Stateless detectors may ignore it.
+            camera: Camera name that owns the track. Used together with
+                pose_id to key per-track state when a single detector
+                instance is shared across multiple cameras (e.g. via a
+                shared pool worker). Optional for legacy per-camera
+                detector instances — stateless detectors may ignore it.
 
         Returns:
             Tuple of (action_type, confidence)
         """
         pass
+
+    def forget(self, pose_id: str, camera: Optional[str] = None) -> None:
+        """Drop any per-track state held for `(camera, pose_id)`.
+
+        Called by the integration layer when a TrackedPose is deleted.
+        `camera` is optional for backwards compatibility with legacy
+        callers. Default no-op covers stateless detectors (e.g. the
+        heuristic).
+        """
+        return

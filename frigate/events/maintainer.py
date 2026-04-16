@@ -152,6 +152,29 @@ class EventProcessor(threading.Thread):
         event_data: Event,
     ) -> None:
         """handle tracked object event updates."""
+        # pose-fork suppress gate (see #60): on cameras with detect.enabled=false
+        # AND pose.detect_persons=false, the ONLY path reaching this function is
+        # pose_consumer's synthesized detected_frames_queue push (no real object
+        # detector runs). The posefall-* lifecycle via handle_pose_detection is
+        # the sole Event source for such cameras; without this gate the standard
+        # tracker's end callback writes a duplicate `person` Event row with the
+        # same pose_track_id. Review segments are unaffected because they are
+        # driven by review_maintainer watching the `detection/video` sub-topic
+        # directly, not via this handler.
+        cam_cfg = self.config.cameras.get(camera)
+        if (
+            cam_cfg is not None
+            and not cam_cfg.detect.enabled
+            and cam_cfg.pose is not None
+            and not getattr(cam_cfg.pose, "detect_persons", True)
+        ):
+            if event_type == EventStateEnum.end:
+                self.events_in_process.pop(event_data["id"], None)
+                # updated_db=False so downstream subscribers (embeddings_maintainer)
+                # don't attempt a DB lookup for an Event row that was never written.
+                self.event_end_publisher.publish((event_data["id"], camera, False))
+            return
+
         updated_db = False
 
         if should_update_db(self.events_in_process[event_data["id"]], event_data):
@@ -294,7 +317,9 @@ class EventProcessor(threading.Thread):
             height = camera_config.detect.height
             # Get first pose detector or None if no detectors configured
             pose_detector_values = list(self.config.pose_detectors.values())
-            first_pose_detector = pose_detector_values[0] if pose_detector_values else None
+            first_pose_detector = (
+                pose_detector_values[0] if pose_detector_values else None
+            )
 
             start_time = event_data["start_time"]
             end_time = (
@@ -343,7 +368,9 @@ class EventProcessor(threading.Thread):
 
             event = {
                 Event.id: event_data["id"],
-                Event.label: event_data.get("action", "pose"),  # Use pose action as label
+                Event.label: event_data.get(
+                    "action", "pose"
+                ),  # Use pose action as label
                 Event.camera: camera,
                 Event.start_time: start_time,
                 Event.end_time: end_time,
@@ -351,9 +378,15 @@ class EventProcessor(threading.Thread):
                 Event.thumbnail: event_data.get("thumbnail"),
                 Event.has_clip: event_data["has_clip"],
                 Event.has_snapshot: event_data["has_snapshot"],
-                Event.model_hash: first_pose_detector.model.model_hash if first_pose_detector else None,
-                Event.model_type: first_pose_detector.model.model_type if first_pose_detector else None,
-                Event.detector_type: first_pose_detector.type if first_pose_detector else None,
+                Event.model_hash: first_pose_detector.model.model_hash
+                if first_pose_detector
+                else None,
+                Event.model_type: first_pose_detector.model.model_type
+                if first_pose_detector
+                else None,
+                Event.detector_type: first_pose_detector.type
+                if first_pose_detector
+                else None,
                 Event.data: {
                     "box": box,
                     "region": region,
@@ -369,7 +402,9 @@ class EventProcessor(threading.Thread):
             # only overwrite the sub_label in the database if it's set (for pose action)
             if event_data.get("action") is not None:
                 event[Event.sub_label] = event_data["action"]
-                event[Event.data]["action_confidence"] = event_data.get("action_confidence", 0.0)
+                event[Event.data]["action_confidence"] = event_data.get(
+                    "action_confidence", 0.0
+                )
 
             (
                 Event.insert(event)

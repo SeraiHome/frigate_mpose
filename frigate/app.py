@@ -493,6 +493,35 @@ class FrigateApp:
         ]
 
         if pose_enabled_cameras and hasattr(self.config, "pose_detectors"):
+            # Spawn any configured pose activity detector pools BEFORE the
+            # TrackedPoseProcessor starts, so the processor can hand out the
+            # pool proxies when initializing per-camera activity detectors.
+            # Each entry in self.config.pose_activity_detectors defines one
+            # shared worker process that serves classification requests from
+            # all cameras pointing at it via pose.activity_detector_pool.
+            self.pose_activity_pools: dict = {}
+            activity_pool_cfgs = getattr(
+                self.config, "pose_activity_detectors", {}
+            ) or {}
+            if activity_pool_cfgs:
+                from frigate.pose_activity_detectors.pool import PoseActivityPool
+
+                for pool_name, pool_cfg in activity_pool_cfgs.items():
+                    try:
+                        self.pose_activity_pools[pool_name] = PoseActivityPool(
+                            name=pool_name,
+                            detector_config=pool_cfg,
+                            stop_event=self.stop_event,
+                        )
+                        logger.info(
+                            f"Started pose activity detector pool '{pool_name}' "
+                            f"(type={pool_cfg.type})"
+                        )
+                    except Exception:
+                        logger.exception(
+                            f"Failed to start pose activity detector pool '{pool_name}'"
+                        )
+
             from frigate.track.pose_processing import TrackedPoseProcessor
 
             self.tracked_pose_processor = TrackedPoseProcessor(
@@ -501,6 +530,7 @@ class FrigateApp:
                 self.tracked_poses_queue,
                 self.stop_event,
                 ptz_autotracker_thread=self.ptz_autotracker_thread,
+                activity_pools=self.pose_activity_pools,
             )
             self.tracked_pose_processor.start()
 
@@ -517,6 +547,12 @@ class FrigateApp:
                 camera_metrics=self.camera_metrics,
                 ptz_autotracker_thread=self.ptz_autotracker_thread,
                 detected_frames_queue=self.detected_frames_queue,
+                # Pass the standard tracker so pose_consumer can mutate
+                # object_processing's actual TrackedObject.obj_data when
+                # an action (e.g. "falling") is classified. Both threads
+                # run in the same main frigate process and share memory,
+                # so the mutation reaches the MQTT serializer.
+                tracked_object_processor=self.detected_frames_processor,
             )
             self.pose_consumer.start()
             logger.info(
@@ -757,6 +793,19 @@ class FrigateApp:
             self.tracked_pose_processor.join()
             empty_and_close_queue(self.tracked_poses_queue)
             logger.info("Tracked poses queue closed")
+
+        # Stop any pose activity detector pool workers
+        if hasattr(self, "pose_activity_pools"):
+            for pool_name, pool in self.pose_activity_pools.items():
+                try:
+                    pool.stop()
+                    logger.info(
+                        f"Pose activity detector pool '{pool_name}' stopped"
+                    )
+                except Exception:
+                    logger.exception(
+                        f"Error stopping pose activity detector pool '{pool_name}'"
+                    )
 
         self.timeline_processor.join()
         self.event_processor.join()

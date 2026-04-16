@@ -2,7 +2,9 @@ import logging
 import queue
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
+from typing import Optional
 
+import cv2
 import numpy as np
 
 from frigate.config import CameraConfig
@@ -14,9 +16,70 @@ from frigate.pose_detection.tensor_utils import (
 )
 from frigate.pose_detectors.detector_config import PoseModelConfig
 from frigate.track.tracked_pose import TrackedPose
-from frigate.util.image import yuv_region_2_rgb
+from frigate.util.image import intersection_over_union, yuv_region_2_rgb
 
 logger = logging.getLogger(__name__)
+
+
+def _bbox_xywh_to_xyxy(bbox):
+    """Convert an [x, y, w, h] bbox to the [x1, y1, x2, y2] format expected by
+    `frigate.util.image.intersection_over_union`. Returns None if the input
+    is malformed so callers can gracefully fall back to centroid matching.
+    """
+    if bbox is None:
+        return None
+    try:
+        if len(bbox) < 4:
+            return None
+        x, y, w, h = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+        if w <= 0 or h <= 0:
+            return None
+        return [int(x), int(y), int(x + w), int(y + h)]
+    except (TypeError, ValueError):
+        return None
+
+
+# Target height (px) for the encoded thumbnail.  Matches the size that
+# `frigate.track.tracked_object.TrackedObject.get_thumbnail` uses for
+# standard person events, so the two thumbnail sources look identical
+# in the dashboard.
+_POSE_THUMBNAIL_TARGET_HEIGHT = 175
+
+
+def _encode_pose_thumbnail(frame: np.ndarray) -> Optional[bytes]:
+    """Encode a small webp thumbnail from a YUV I420 frame.
+
+    Used by `PoseDetectionIntegration.detect_poses` to ship a thumbnail
+    through the tracked-poses queue so `pose_consumer` can persist it
+    when a pose-driven Event is finalized.  Without this, pose-driven
+    events have no `THUMB_DIR/{cam}/{event_id}.webp` file and the
+    standard `/api/events/{id}/thumbnail.{ext}` route 404s.
+
+    The frame is the live YUV I420 buffer the pose detector just ran
+    against.  This function MUST run in the same process and call stack
+    as `detect_poses`, while the SHM-backed numpy view is still valid.
+    """
+    if not isinstance(frame, np.ndarray) or frame.ndim < 2:
+        return None
+
+    try:
+        bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+    except Exception:
+        return None
+
+    h, w = bgr.shape[:2]
+    if h > _POSE_THUMBNAIL_TARGET_HEIGHT:
+        scale = _POSE_THUMBNAIL_TARGET_HEIGHT / float(h)
+        bgr = cv2.resize(
+            bgr,
+            (int(w * scale), _POSE_THUMBNAIL_TARGET_HEIGHT),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    ok, buf = cv2.imencode(".webp", bgr, [int(cv2.IMWRITE_WEBP_QUALITY), 80])
+    if not ok:
+        return None
+    return buf.tobytes()
 
 
 class PoseDetectionIntegration:
@@ -191,7 +254,8 @@ class PoseDetectionIntegration:
                             pass  # leave bbox as-is on failure
 
                     # Map keypoints from model pixels → region pixels → full-frame
-                    # This ensures STGCN normalization is consistent regardless of ROI size
+                    # This keeps downstream classifier normalization consistent
+                    # regardless of ROI size
                     keypoints = p.get("keypoints")
                     if keypoints is not None:
                         try:
@@ -213,14 +277,31 @@ class PoseDetectionIntegration:
             else:
                 detected_poses = []
 
-            # Track and process poses using FULL FRAME dimensions for consistent
-            # STGCN normalization regardless of ROI size changes between frames
+            # Track and process poses using FULL FRAME dimensions so downstream
+            # classifier normalization is consistent regardless of ROI size
+            # changes between frames.
             tracked_poses = self.track_poses(
                 detected_poses, frame_time, full_frame_width, full_frame_height
             )
 
-            # Send tracked poses to the queue for further processing
+            # Send tracked poses to the queue for further processing.
+            #
+            # We also encode a small webp thumbnail from the YUV frame in
+            # this same process, while the SHM-backed `frame` is still
+            # valid.  pose_consumer can't reliably read frames from SHM
+            # asynchronously (the camera's circular buffer rotates faster
+            # than the pose-action lifecycle), so we ship the thumbnail
+            # bytes through the queue.
             if tracked_poses:
+                thumbnail_bytes: Optional[bytes] = None
+                try:
+                    thumbnail_bytes = _encode_pose_thumbnail(frame)
+                except Exception:
+                    logger.debug(
+                        f"Failed to encode pose thumbnail for {self.camera_name}",
+                        exc_info=True,
+                    )
+
                 try:
                     self.tracked_poses_queue.put(
                         (
@@ -229,6 +310,7 @@ class PoseDetectionIntegration:
                             tracked_poses,
                             motion_boxes,
                             regions,
+                            thumbnail_bytes,
                         ),
                         False,
                     )
@@ -435,12 +517,47 @@ class PoseDetectionIntegration:
             frame_width: Width of the frame in pixels, used for keypoint normalization
             frame_height: Height of the frame in pixels, used for keypoint normalization
         """
+        # Wall-clock seconds a track may go without a matching detection
+        # before we release its id. Seconds-based (not frames-based) so
+        # behavior is stable across cameras with different detect.fps.
+        # See pose.track_max_disappeared_seconds docs and #60 follow-up.
+        max_gap_seconds = float(
+            getattr(self.pose_config, "track_max_disappeared_seconds", 3.0)
+        )
+
         # First, predict the state of existing tracked poses
         for pose_id, tracked_pose in list(self.tracked_poses.items()):
             tracked_pose.predict()
 
-            # Remove old poses that haven't been updated in a while
-            if tracked_pose.time_since_update > 10:
+            # Remove old poses that haven't been updated in a while.
+            # Compare against frame_time (wall-clock) rather than the
+            # frames-based time_since_update counter.
+            last_seen = getattr(tracked_pose, "frame_time", None) or 0.0
+            if frame_time - last_seen > max_gap_seconds:
+                # Give the activity detector a chance to drop its per-track
+                # state (sliding window + hysteresis deque) so the deleted
+                # track's history doesn't leak into any future track that
+                # happens to reuse the same pose_id string. Pass the owning
+                # camera name so detectors keyed by (camera, pose_id) (e.g.
+                # shared pool workers) drop the correct bucket.
+                detector = getattr(tracked_pose, "active_detector", None)
+                if detector is not None:
+                    forget = getattr(detector, "forget", None)
+                    if callable(forget):
+                        try:
+                            forget(pose_id, camera=self.camera_name)
+                        except TypeError:
+                            # Legacy detectors without the camera kwarg.
+                            try:
+                                forget(pose_id)
+                            except Exception as exc:
+                                logger.debug(
+                                    f"activity_detector.forget({pose_id}) failed: {exc}"
+                                )
+                        except Exception as exc:
+                            logger.debug(
+                                f"activity_detector.forget({pose_id}) failed: {exc}"
+                            )
                 del self.tracked_poses[pose_id]
 
         # Match detected poses with existing tracked poses or create new ones
@@ -505,8 +622,11 @@ class PoseDetectionIntegration:
             # Build candidates list of currently tracked poses
             candidates = []
             for tid, tpose in self.tracked_poses.items():
-                # Skip poses that were just deleted or have excessive time since update
-                if tpose.time_since_update > 10:
+                # Skip poses with excessive wall-clock gap since last update.
+                # Use the same seconds-based threshold as the deletion pass
+                # above so matching and deletion share one source of truth.
+                t_last_seen = getattr(tpose, "frame_time", None) or 0.0
+                if frame_time - t_last_seen > max_gap_seconds:
                     continue
                 # Compute tracked centroid
                 try:
@@ -535,51 +655,81 @@ class PoseDetectionIntegration:
 
                 candidates.append((tid, tpose, t_centroid, tpose.bbox))
 
-            best_score = float("inf")
-            best_candidate = None
-
-            # Compute normalization diagonal
+            # Compute normalization diagonal (for the centroid fallback path)
             if frame_width and frame_height:
                 diag = (frame_width**2 + frame_height**2) ** 0.5
             else:
                 diag = None
 
+            # Thresholds are PoseConfig fields, validated by Pydantic. Read
+            # directly -- no literal fallbacks, so config.yml overrides the
+            # default cleanly and there is a single source of truth.
+            iou_threshold = self.pose_config.track_match_iou_threshold
+            centroid_threshold = self.pose_config.track_match_centroid_threshold
+
+            # Score each candidate. Prefer IoU of bboxes (rotation-invariant,
+            # survives a standing->lying fall transition). Also compute the
+            # centroid distance as a second-chance rescue for cases where
+            # the pose detector outputs wildly different bbox shapes between
+            # consecutive frames of the same subject (e.g. a 52x156 standing
+            # box becoming 71x334 as the detector re-estimates extent -- the
+            # IoU drops below threshold but the centroids are still close).
+            #
+            # `best_match` holds (tid, tpose, score, score_type) where
+            # score_type is "iou" (higher is better) or "centroid" (lower
+            # is better). An IoU match always wins over a centroid match,
+            # but centroid matches still rescue the IoU-below-threshold case.
+            best_match = None
+            det_xyxy = _bbox_xywh_to_xyxy(det_bbox) if det_bbox is not None else None
+
             for tid, tpose, t_centroid, t_bbox in candidates:
-                score = float("inf")
-                # distance-based score
-                if det_centroid is not None and t_centroid is not None:
+                # IoU path (preferred when both sides have bbox)
+                iou_cleared = False
+                if det_xyxy is not None and t_bbox is not None:
+                    t_xyxy = _bbox_xywh_to_xyxy(t_bbox)
+                    if t_xyxy is not None:
+                        try:
+                            iou = float(intersection_over_union(det_xyxy, t_xyxy))
+                        except Exception:
+                            iou = 0.0
+                        if iou >= iou_threshold:
+                            iou_cleared = True
+                            if (
+                                best_match is None
+                                or best_match[3] != "iou"
+                                or iou > best_match[2]
+                            ):
+                                best_match = (tid, tpose, iou, "iou")
+
+                # Centroid path: runs unconditionally as a rescue whenever
+                # IoU did not clear the threshold for this candidate. When
+                # IoU already cleared, skip centroid (IoU is authoritative).
+                if iou_cleared:
+                    continue
+                if (
+                    det_centroid is not None
+                    and t_centroid is not None
+                    and diag
+                    and diag > 0
+                ):
                     try:
-                        dist = np.linalg.norm(det_centroid - t_centroid)
-                        if diag and diag > 0:
-                            dist_norm = dist / diag
-                        else:
-                            dist_norm = dist
-                        score = dist_norm
+                        dist_norm = (
+                            float(np.linalg.norm(det_centroid - t_centroid)) / diag
+                        )
                     except Exception:
-                        score = float("inf")
+                        continue
+                    if dist_norm <= centroid_threshold:
+                        # Only accept a centroid candidate if no IoU match
+                        # exists yet -- IoU always beats centroid. Among
+                        # centroid candidates, lowest normalized distance wins.
+                        if best_match is None or (
+                            best_match[3] == "centroid" and dist_norm < best_match[2]
+                        ):
+                            best_match = (tid, tpose, dist_norm, "centroid")
 
-                if score < best_score:
-                    best_score = score
-                    best_candidate = (tid, tpose, t_centroid, t_bbox)
-
-            # Match only if centroid distance is below threshold. Use strict matching:
-            # 0.05 (5%) of diagonal is a reasonable threshold for same person in consecutive frames.
-            match = False
-            if (
-                best_candidate is not None
-                and det_centroid is not None
-                and diag
-                and diag > 0
-            ):
-                tid, tpose, t_centroid, t_bbox = best_candidate
-                try:
-                    dist = np.linalg.norm(det_centroid - t_centroid)
-                    if (dist / diag) < 0.1:
-                        match = True
-                        matched_id = tid
-                        matched_pose = tpose
-                except Exception:
-                    match = False
+            if best_match is not None:
+                matched_id = best_match[0]
+                matched_pose = best_match[1]
 
             if matched_pose:
                 pose_id = matched_id
@@ -649,10 +799,18 @@ class PoseDetectionIntegration:
             self.tracked_poses[pose_id] = tracked_pose
             tracked.append(tracked_pose)
 
-        # Return all currently tracked poses that were updated this frame
-        return [
-            pose for pose in self.tracked_poses.values() if pose.time_since_update == 0
-        ]
+        # Return all currently ALIVE tracked poses, not just the ones updated
+        # this frame. The deletion pass at the top of this method has already
+        # pruned poses whose wall-clock gap exceeded track_max_disappeared_seconds,
+        # so whatever remains in self.tracked_poses is still considered present.
+        # Returning stale poses (time_since_update > 0) during brief pose-detector
+        # gaps keeps downstream CameraState lifecycles (pose_consumer + the
+        # standard tracker fed by the detected_frames_queue push) from cycling
+        # create/destroy on every missed frame. Activity classification runs
+        # via the freshness-gated `TrackedPose.classify()` call in
+        # pose_processing.py, not on this return value, so there is no risk of
+        # running classifier inference on stale keypoints.
+        return list(self.tracked_poses.values())
 
     def cleanup(self):
         """Clean up resources used by the pose detector."""

@@ -35,6 +35,19 @@ class RecordingCleanup(threading.Thread):
                 logger.debug("Deleting preview.")
                 clear_and_unlink(p)
 
+        # Clean orphaned webp preview frames older than 2 hours.
+        # Normally these are cleaned by FFMpegConverter after each hourly segment,
+        # but frames can leak if conversion encounters an unexpected exception.
+        preview_frames_dir = Path(os.path.join(CACHE_DIR, "preview_frames"))
+        if preview_frames_dir.exists():
+            stale_threshold = datetime.datetime.now().timestamp() - 2 * 60 * 60
+            for p in preview_frames_dir.glob("preview_*.webp"):
+                try:
+                    if p.stat().st_mtime < stale_threshold:
+                        p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     def clean_tmp_clips(self) -> None:
         """delete any clips in the cache that are more than 1 hour old."""
         for p in Path(os.path.join(CLIPS_DIR, "cache")).rglob("clip_*.mp4"):

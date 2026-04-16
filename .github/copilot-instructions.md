@@ -1,6 +1,6 @@
 <!-- Copilot / AI Agent instructions for contributors and automated agents -->
 
-# Frigate (SeraiHome fork) — AI agent guidance
+# Frigate pose fork — AI agent guidance
 
 This file gives concise, actionable context for AI coding agents working in this repository. Keep answers tight and reference the files listed below when making changes.
 

@@ -478,3 +478,11 @@ Topic to suspend notifications for a certain number of minutes. Expected value i
 ### `frigate/<camera_name>/notifications/suspended`
 
 Topic with timestamp that notifications are suspended until. Published value is a UNIX timestamp, or 0 if notifications are not suspended.
+
+### `frigate/<camera_name>/pose/set`
+
+Topic to turn pose detection for a camera on and off. Expected values are `ON` and `OFF`. Pose detection must be enabled in the camera configuration (`pose.enabled: true`). This controls pose detection only — camera feed privacy (stopping/starting feeds) is handled separately via go2rtc.
+
+### `frigate/<camera_name>/pose/state`
+
+Topic with current state of pose detection for a camera. Published values are `ON` and `OFF`.

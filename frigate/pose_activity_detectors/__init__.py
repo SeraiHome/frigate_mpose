@@ -11,7 +11,9 @@ import os
 from typing import Dict, Optional, Type
 
 from frigate.pose_activity_detectors.base import PoseActivityDetector
-from frigate.pose_activity_detectors.detector_config import BasePoseActivityDetectorConfig
+from frigate.pose_activity_detectors.detector_config import (
+    BasePoseActivityDetectorConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +26,7 @@ def register_detector(name: str, detector_cls: Type[PoseActivityDetector]) -> No
     Register a detector type with the system.
 
     Args:
-        name: The name to register the detector under (e.g., "stgcn_fall", "heuristic")
+        name: The name to register the detector under (e.g., "heuristic")
         detector_cls: The detector class to register
     """
     DETECTOR_REGISTRY[name] = detector_cls
@@ -60,13 +62,19 @@ def load_detector_plugins() -> None:
         if filename.endswith(".py") and not filename.startswith("__"):
             module_name = filename[:-3]  # Remove the .py extension
             try:
-                importlib.import_module(f"frigate.pose_activity_detectors.plugins.{module_name}")
+                importlib.import_module(
+                    f"frigate.pose_activity_detectors.plugins.{module_name}"
+                )
                 logger.debug(f"Loaded pose activity detector plugin: {module_name}")
             except ImportError as e:
-                logger.error(f"Failed to load pose activity detector plugin {module_name}: {e}")
+                logger.error(
+                    f"Failed to load pose activity detector plugin {module_name}: {e}"
+                )
 
 
-def create_activity_detector(config: BasePoseActivityDetectorConfig) -> Optional[PoseActivityDetector]:
+def create_activity_detector(
+    config: BasePoseActivityDetectorConfig,
+) -> Optional[PoseActivityDetector]:
     """
     Create an activity detector instance based on the configuration.
 

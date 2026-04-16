@@ -145,8 +145,10 @@ class ReviewDescriptionProcessor(PostProcessorApi):
 
             important_items = list(
                 filter(
-                    lambda item: item.get("potential_threat_level", 0) > 0
-                    or item.get("other_concerns"),
+                    lambda item: (
+                        item.get("potential_threat_level", 0) > 0
+                        or item.get("other_concerns")
+                    ),
                     items,
                 )
             )

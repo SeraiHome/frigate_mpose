@@ -580,17 +580,21 @@ class ReviewSegmentMaintainer(threading.Thread):
                         frame_name, camera_config.frame_shape_yuv
                     )
 
-                    if yuv_frame is None:
-                        logger.debug(f"Failed to get frame {frame_name} from SHM")
-                        return
-
-                    self.active_review_segments[camera].update_frame(
-                        camera_config, yuv_frame, activity.get_all_objects()
-                    )
-                    self.frame_manager.close(frame_name)
-                    self._publish_segment_start(self.active_review_segments[camera])
+                    if yuv_frame is not None:
+                        self.active_review_segments[camera].update_frame(
+                            camera_config, yuv_frame, activity.get_all_objects()
+                        )
+                        self.frame_manager.close(frame_name)
+                    else:
+                        logger.debug(
+                            f"Frame {frame_name} not in SHM, segment starts without thumbnail"
+                        )
                 except FileNotFoundError:
-                    return
+                    logger.debug(
+                        f"Frame {frame_name} not found, segment starts without thumbnail"
+                    )
+
+                self._publish_segment_start(self.active_review_segments[camera])
 
     def run(self) -> None:
         while not self.stop_event.is_set():

@@ -94,10 +94,13 @@ class PoseModelConfig(BaseModel):
     #     None, title="Custom model path for fall detection"
     # )
 
-    _model_hash: str = PrivateAttr()
+    _model_hash: Optional[str] = PrivateAttr(default=None)
 
     @property
-    def model_hash(self) -> str:
+    def model_hash(self) -> Optional[str]:
+        # PrivateAttr default is None until compute_model_hash() runs.
+        # handle_pose_detection() in events/maintainer.py already accepts
+        # None for this field, so callers don't need to special-case it.
         return self._model_hash
 
     def __init__(self, **config):
