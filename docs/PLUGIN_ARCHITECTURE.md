@@ -221,7 +221,19 @@ Architectural shape:
 
 Blocked on model deliverables. Getting the current activity classifier onto an Edge TPU requires either quantization-aware retraining or a hardware-friendly replacement architecture; that work lives on the ML side, not the Frigate side. Once a compatible model lands, flipping the pool to the target accelerator is a single config field change on the pool entry — the architecture is in place.
 
-### 5e. Multi-device scale-out
+### 5e. Device contention between object detection and activity classification
+
+Frigate's existing object detector pool and the activity classifier pool are **separate processes**, each loading their own interpreter and device delegate independently. On most accelerator APIs this is fine — CUDA, OpenVINO, and RKNN runtimes all support multiple processes sharing a device via the driver's scheduler, each with its own context.
+
+**Coral (Edge TPU) is the exception.** `libedgetpu.so.1.0` acquires exclusive USB device access when a process loads the delegate. Two separate pool processes — one for object detection, one for activity classification — each calling `load_delegate("libedgetpu.so.1.0", {"device": "usb:0"})` would contend for the same physical device. The library was not designed for cross-process sharing of a single USB device.
+
+For single-Coral deployments where both object detection and activity classification need TPU acceleration, the correct architectural solution would be: **one process, one delegate, multiple workloads** — merging the object detector pool and the activity classifier pool into a single "inference service" process that multiplexes different models through one interpreter. That's a deeper change than the current pool-per-workload pattern and is not implemented today. Workarounds for current hardware:
+
+- **Two Coral devices** — `usb:0` for object detection, `usb:1` for activity classification. Each pool gets its own device. Works today with the existing config surface.
+- **Coral for objects, CPU inline for classification** — activity classifiers on keypoints are lightweight enough to run on CPU without bottlenecking (204 bytes input, <1ms for heuristic, ~80ms for neural). The CPU path is the default and doesn't contend with Coral at all.
+- **YOLO-pose in the existing detector pool** — a YOLO-pose model produces both bounding boxes and keypoints in one inference pass on one Coral device. No second pool needed. The activity classifier then runs downstream on CPU using the keypoints from the YOLO-pose output. This is the most efficient single-Coral architecture for combined object + pose detection.
+
+### 5f. Multi-device scale-out
 
 The pool design trivially extends to N pools on N devices. Define multiple pool entries under `pose_activity_detectors:`, each with its own `device:` string, and map cameras to pools as desired. Accelerator *auto-discovery* (enumerating available devices at startup and assigning one per pool automatically) is not implemented; device strings are set per pool in config today.
 
@@ -343,6 +355,9 @@ Today it's ~50 lines in `video.py`. That's exactly why extension point #2 (detec
 
 **"Motion-gated pose detection could miss slow events."**
 Pose detection inherits Frigate's existing motion gate behavior. Slow events that don't trigger motion also don't trigger any current Frigate feature. Operators who need lower motion thresholds tune them the same way they do for any other Frigate feature — no new configuration surface.
+
+**"What if both the object detector and the activity classifier want the same Coral?"**
+On most accelerators (CUDA, OpenVINO, RKNN) multiple processes can share the device via the driver's scheduler — no conflict. Coral is the exception: `libedgetpu` acquires exclusive USB device access per process, so two pool processes loading delegates on the same `usb:0` would contend. For single-Coral deployments the cleanest answer is YOLO-pose in the existing detector pool (one model, one Coral, both boxes and keypoints in one pass), with the activity classifier running downstream on CPU. For multi-Coral deployments, each pool gets its own device via the `device:` config field. See §5e for the full analysis.
 
 **"Running neural activity classifiers on every frame is expensive."**
 Activity classifiers range from trivial (heuristic rule-based, handful of joint angle computations) to non-trivial (sliding-window neural nets). The plugin architecture accommodates both. Motion gating ensures the pipeline is quiet on empty scenes. Per-camera processes keep one camera's activity classifier from blocking another's. Per-camera accelerator assignment (§5) spreads the compute load across devices. The opt-in-per-camera design means users who don't need this pay nothing.
