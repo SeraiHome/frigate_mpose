@@ -66,9 +66,9 @@ Pose detection is **gated by Frigate's existing motion detection** — if no mot
 
 ## 4. Plugin architecture — mirrors what Frigate already does
 
-Frigate's detector plugin layer at [`frigate/detectors/detector_types.py:17-37`](../frigate/detectors/detector_types.py) uses `pkgutil.iter_modules` to walk a plugins directory at import, discovers subclasses via `DetectionApi.__subclasses__()`, builds a `type_key` → class lookup dict, and generates a dynamic `DetectorTypeEnum` for Pydantic config discrimination.
+Frigate's detector plugin layer at [`frigate/detectors/detector_types.py:17-37`](https://github.com/SeraiHome/frigate_mpose/blob/dev/frigate/detectors/detector_types.py) uses `pkgutil.iter_modules` to walk a plugins directory at import, discovers subclasses via `DetectionApi.__subclasses__()`, builds a `type_key` → class lookup dict, and generates a dynamic `DetectorTypeEnum` for Pydantic config discrimination.
 
-The fork's pose detector plugin layer at [`frigate/pose_detectors/detector_types.py:17-35`](../frigate/pose_detectors/detector_types.py) is **literally the same pattern**, line for line — same `pkgutil.iter_modules` walk, same `__subclasses__()` discovery, same `StrEnum` from `type_key`, same Pydantic discriminated-union config. The base class is minimal:
+The fork's pose detector plugin layer at [`frigate/pose_detectors/detector_types.py:17-35`](https://github.com/SeraiHome/frigate_mpose/blob/dev/frigate/pose_detectors/detector_types.py) is **literally the same pattern**, line for line — same `pkgutil.iter_modules` walk, same `__subclasses__()` discovery, same `StrEnum` from `type_key`, same Pydantic discriminated-union config. The base class is minimal:
 
 ```python
 class PoseDetectionApi(ABC):
@@ -87,7 +87,7 @@ class PoseDetectionApi(ABC):
 
 New implementations drop into `frigate/pose_detectors/plugins/` with a unique `type_key`. Current implementations: `mediapipe`, `mediapipe_task`, `yolo_pose`, `cpu`.
 
-The pose activity detector layer uses an explicit `register_detector(name, class)` call at module import (rather than subclass discovery) because activity detectors carry non-trivial state that plugin authors want to initialize explicitly. The registry is a ~50-line `DETECTOR_REGISTRY` dict in [`frigate/pose_activity_detectors/__init__.py:20-73`](../frigate/pose_activity_detectors/__init__.py). The base class carries a per-track state contract:
+The pose activity detector layer uses an explicit `register_detector(name, class)` call at module import (rather than subclass discovery) because activity detectors carry non-trivial state that plugin authors want to initialize explicitly. The registry is a ~50-line `DETECTOR_REGISTRY` dict in [`frigate/pose_activity_detectors/__init__.py:20-73`](https://github.com/SeraiHome/frigate_mpose/blob/dev/frigate/pose_activity_detectors/__init__.py). The base class carries a per-track state contract:
 
 ```python
 def detect(
@@ -150,7 +150,7 @@ The pose subsystem runs on two architectural layers that have different parallel
 - **Layer 1 — pose detection (per-camera).** Frame-ordered, stateful in the interpreter, one process per camera (§2b Kind 1). Each process holds its own TFLite/ONNX session; accelerator assignment is per-camera.
 - **Layer 2 — activity classification.** Per-track sliding-window inference with explicit state keyed by `(camera, pose_id)` (§2b Kind 2). Two deployment modes: **per-camera inline** (default, recommended for CPU — each camera gets its own classifier instance in its own thread, TFLite releases the GIL so N cameras = N concurrent inferences) or **shared pool** (opt-in for shared-accelerator deployments — one worker process centralizes inference on a single device). Choice is a single config field on each camera.
 
-[`frigate/pose_detectors/detector_config.py:178-189`](../frigate/pose_detectors/detector_config.py) exposes the plumbing for Layer 1, and a parallel `BasePoseActivityDetectorConfig` does the same for Layer 2:
+[`frigate/pose_detectors/detector_config.py:178-189`](https://github.com/SeraiHome/frigate_mpose/blob/dev/frigate/pose_detectors/detector_config.py) exposes the plumbing for Layer 1, and a parallel `BasePoseActivityDetectorConfig` does the same for Layer 2:
 
 ```python
 class BasePoseDetectorConfig(FrigateBaseModel):
@@ -164,7 +164,7 @@ class BasePoseDetectorConfig(FrigateBaseModel):
 
 | Plugin | Hardware acceleration |
 |---|---|
-| `yolo_pose` | **GPU (CUDA) via ONNX Runtime** — wired and tested. `device: "gpu"` adds the `CUDAExecutionProvider` to the session ([`yolo_pose.py:31-56`](../frigate/pose_detectors/plugins/yolo_pose.py)). YOLO-pose is also a plausible candidate for Coral acceleration via `edgetpu_compiler`, since the model is a standard TFLite detector and the compiler readily handles it. Coral quantization of yolo_pose is on the roadmap but not yet validated end-to-end. |
+| `yolo_pose` | **GPU (CUDA) via ONNX Runtime** — wired and tested. `device: "gpu"` adds the `CUDAExecutionProvider` to the session ([`yolo_pose.py:31-56`](https://github.com/SeraiHome/frigate_mpose/blob/dev/frigate/pose_detectors/plugins/yolo_pose.py)). YOLO-pose is also a plausible candidate for Coral acceleration via `edgetpu_compiler`, since the model is a standard TFLite detector and the compiler readily handles it. Coral quantization of yolo_pose is on the roadmap but not yet validated end-to-end. |
 | `mediapipe_task` | **CPU only today.** The MediaPipe Tasks Python API exposes `BaseOptions.delegate` for GPU only; no Coral delegate is present in the enum.  |
 | `mediapipe` (legacy) | CPU only. |
 | `cpu` | CPU only by design. |
@@ -175,7 +175,7 @@ A deployment with N pose-enabled cameras spawns N independent `PoseDetectProcess
 
 **Default: per-camera inline.** Each camera's `TrackedPoseProcessor` thread holds its own classifier instance. Classification runs synchronously after each `TrackedPose.classify()` call with zero IPC overhead. TFLite releases the GIL during inference, so N cameras produce N genuinely concurrent classifier calls in the same process. This is the recommended mode for CPU-only deployments.
 
-**Opt-in: shared pool for hardware accelerator sharing.** When multiple cameras need to share a single hardware accelerator device (e.g. one Coral USB TPU), the pool pattern centralizes inference into one dedicated worker process holding one interpreter and one device delegate. The pool is implemented in [`frigate/pose_activity_detectors/pool.py`](../frigate/pose_activity_detectors/pool.py). The pool is NOT recommended for CPU-only deployments — a single worker serializes what inline mode runs concurrently, causing queue backpressure under multi-camera load.
+**Opt-in: shared pool for hardware accelerator sharing.** When multiple cameras need to share a single hardware accelerator device (e.g. one Coral USB TPU), the pool pattern centralizes inference into one dedicated worker process holding one interpreter and one device delegate. The pool is implemented in [`frigate/pose_activity_detectors/pool.py`](https://github.com/SeraiHome/frigate_mpose/blob/dev/frigate/pose_activity_detectors/pool.py). The pool is NOT recommended for CPU-only deployments — a single worker serializes what inline mode runs concurrently, causing queue backpressure under multi-camera load.
 
 Architectural shape:
 
@@ -229,7 +229,7 @@ The pool design trivially extends to N pools on N devices. Define multiple pool 
 
 ## 6. Per-camera process implementation
 
-One dedicated pose detector process per pose-enabled camera, spawned at startup from [`frigate/app.py:449-465`](../frigate/app.py):
+One dedicated pose detector process per pose-enabled camera, spawned at startup from [`frigate/app.py:449-465`](https://github.com/SeraiHome/frigate_mpose/blob/dev/frigate/app.py):
 
 ```python
 for camera_name in pose_enabled_cameras:
@@ -248,7 +248,7 @@ for camera_name in pose_enabled_cameras:
 
 Each process receives its own queue, reads frames from its own SHM segment, writes results back to its own output SHM segment.
 
-**Frame bridge (input).** Shared memory segment named `pose-{camera_name}`, sized per-camera based on the camera's `detect.width × detect.height`. Layout documented in [`frigate/pose_detection/shm_format.py:1-54`](../frigate/pose_detection/shm_format.py):
+**Frame bridge (input).** Shared memory segment named `pose-{camera_name}`, sized per-camera based on the camera's `detect.width × detect.height`. Layout documented in [`frigate/pose_detection/shm_format.py:1-54`](https://github.com/SeraiHome/frigate_mpose/blob/dev/frigate/pose_detection/shm_format.py):
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -261,7 +261,7 @@ Each process receives its own queue, reads frames from its own SHM segment, writ
 
 Dynamic sizing — the pose detector runs at the camera's native resolution (quality matters for keypoints on far-from-camera subjects). The header reports actual dimensions to the consumer.
 
-**Result bridge (output).** Shared memory segment `pose-out-{camera_name}` holding a fixed-shape `(20, 57)` float32 array — up to 20 detections per frame, each encoded as `[person_id, confidence, 17×3 keypoints, 4 bbox]`. Created in [`frigate/pose_detection/base.py:140-146`](../frigate/pose_detection/base.py).
+**Result bridge (output).** Shared memory segment `pose-out-{camera_name}` holding a fixed-shape `(20, 57)` float32 array — up to 20 detections per frame, each encoded as `[person_id, confidence, 17×3 keypoints, 4 bbox]`. Created in [`frigate/pose_detection/base.py:140-146`](https://github.com/SeraiHome/frigate_mpose/blob/dev/frigate/pose_detection/base.py).
 
 Memory usage scales linearly with the number of pose-enabled cameras, which matches Frigate's existing per-camera resource model.
 
